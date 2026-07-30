@@ -1,0 +1,12 @@
+{
+  "provider": "mock",
+  "intervalMinutes": 360,
+  "ripeDays": 21,
+  "historyDepth": 40,
+  "scoreThreshold": 70,
+  "stores": ["0121"],
+  "skus": [
+    { "sku": "DEMO-100", "label": "Demo: LED shop light" },
+    { "sku": "DEMO-200", "label": "Demo: cabinet hardware 10-pack" }
+  ]
+}

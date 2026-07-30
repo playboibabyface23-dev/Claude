@@ -1,15 +1,17 @@
 {
   "name": "pennyrun",
-  "version": "0.1.0",
-  "description": "Field app + pipeline monitor for pre-foreclosure wholesalers driving for dollars",
+  "version": "0.2.0",
+  "description": "Clearance-ladder monitor + in-store field app for hunting retail penny deals",
   "type": "module",
   "private": true,
   "bin": {
-    "pennyrun-monitor": "./monitor/cli.js"
+    "pennyrun-monitor": "./monitor/index.js"
   },
   "scripts": {
-    "test": "node --test \"monitor/**/*.test.js\"",
-    "monitor": "node monitor/cli.js report"
+    "test": "node monitor/test-ladder.js",
+    "once": "node monitor/index.js once",
+    "watch": "node monitor/index.js watch",
+    "export": "node monitor/index.js export"
   },
   "engines": {
     "node": ">=18"

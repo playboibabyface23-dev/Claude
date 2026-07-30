@@ -1,7 +1,7 @@
-# Real lead data and local config never go in git (see CLAUDE.md "Hard rules")
-leads.json
-*.leads.json
-data/
+# Operational artifacts — state history, briefs, board exports (see CLAUDE.md)
+monitor/data/
+
+# Keys
 .env
 
 node_modules/

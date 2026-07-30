@@ -1,59 +1,63 @@
-// PennyRun field app — a single-file React component for logging distressed
-// properties while driving for dollars. Deliberately self-contained: no
-// imports beyond React, inline styles only, state in localStorage. Paste it
-// into any React host and it works. See ../CLAUDE.md before restructuring.
+// PennyRun field app — the in-store half of PennyRun. React, no build step:
+// a single self-contained component (inline styles, no imports beyond React)
+// that renders as a Claude artifact or in any React host. See ../CLAUDE.md.
+//
+// Board tab  — paste monitor/data/board-export.json, hunt the list in-store
+// Decoder tab — type a shelf price, get its ladder stage and what to do
+// Log tab    — record what the register actually said
 
 import React, { useEffect, useMemo, useState } from "react";
 
-const STORAGE_KEY = "pennyrun.leads.v1";
+const STORAGE_KEY = "pennyrun.field.v1";
 
-const STATUSES = ["new", "contacted", "negotiating", "under_contract", "assigned", "dead"];
-const STATUS_LABELS = {
-  new: "New",
-  contacted: "Contacted",
-  negotiating: "Negotiating",
-  under_contract: "Under contract",
-  assigned: "Assigned",
-  dead: "Dead",
+// Keep in sync with monitor/src/ladder.js — same ladder, same words.
+const STAGE_INFO = {
+  full: {
+    label: "Full price",
+    color: "#6b7280",
+    advice: "Not on the ladder. Walk on.",
+  },
+  first: {
+    label: "First markdown (.06)",
+    color: "#2563eb",
+    advice: "Clock started. Note it, come back — don't buy yet.",
+  },
+  final: {
+    label: "Final markdown (.03)",
+    color: "#d97706",
+    advice: "Last stop before a penny — historically ~3 weeks out. Watch it.",
+  },
+  penny: {
+    label: "PENNY — $0.01",
+    color: "#16a34a",
+    advice: "Scan it at the register to confirm, buy it, be cool about it.",
+  },
 };
-const STATUS_COLORS = {
-  new: "#2563eb",
-  contacted: "#0891b2",
-  negotiating: "#d97706",
-  under_contract: "#7c3aed",
-  assigned: "#16a34a",
-  dead: "#6b7280",
-};
 
-const DISTRESS_SIGNS = [
-  ["tall_grass", "Tall grass"],
-  ["boarded_windows", "Boarded windows"],
-  ["code_violation", "Code violation notice"],
-  ["full_mailbox", "Full mailbox"],
-  ["tarp_roof", "Tarped roof"],
-  ["vacant", "Looks vacant"],
-];
-
-// 70% rule — keep in sync with monitor/lib.js (see CLAUDE.md).
-function mao({ arv, repairs = 0, fee = 0, percent = 0.7 }) {
-  const a = Number.parseFloat(arv);
-  if (!Number.isFinite(a) || a <= 0) return null;
-  const r = Number.parseFloat(repairs) || 0;
-  const f = Number.parseFloat(fee) || 0;
-  return Math.max(0, Math.round(a * percent - r - f));
+function stageFor(price) {
+  const cents = Math.round(price * 100);
+  if (!Number.isFinite(cents) || cents < 0) return null;
+  if (cents === 1) return "penny";
+  const ending = cents % 100;
+  if (ending === 6) return "first";
+  if (ending === 3) return "final";
+  return "full";
 }
 
-function money(n) {
-  return n === null || !Number.isFinite(n) ? "—" : `$${Math.round(n).toLocaleString("en-US")}`;
-}
+const HUNT_STATES = ["hunting", "found", "gone"];
+const HUNT_COLORS = { hunting: "#2563eb", found: "#16a34a", gone: "#6b7280" };
 
-function loadLeads() {
+function loadSaved() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    const parsed = raw ? JSON.parse(raw) : [];
-    return Array.isArray(parsed) ? parsed : [];
+    const data = raw ? JSON.parse(raw) : {};
+    return {
+      board: data.board ?? null,
+      hunt: data.hunt ?? {},
+      finds: Array.isArray(data.finds) ? data.finds : [],
+    };
   } catch {
-    return [];
+    return { board: null, hunt: {}, finds: [] };
   }
 }
 
@@ -99,19 +103,20 @@ const S = {
     borderRadius: 8,
     boxSizing: "border-box",
   },
-  signBtn: (on) => ({
-    padding: "8px 10px",
+  badge: (color) => ({
+    display: "inline-block",
+    padding: "2px 8px",
     borderRadius: 999,
-    border: "1px solid " + (on ? "#b45309" : "#d1d5db"),
-    background: on ? "#fef3c7" : "#fff",
-    color: on ? "#92400e" : "#374151",
-    fontSize: 12,
-    cursor: "pointer",
+    fontSize: 11,
+    fontWeight: 700,
+    color: "#fff",
+    background: color,
   }),
+  small: { fontSize: 12, color: "#6b7280" },
   primary: {
     width: "100%",
     padding: "12px",
-    marginTop: 14,
+    marginTop: 12,
     borderRadius: 8,
     border: "none",
     background: "#b45309",
@@ -120,53 +125,44 @@ const S = {
     fontWeight: 700,
     cursor: "pointer",
   },
-  badge: (status) => ({
-    display: "inline-block",
-    padding: "2px 8px",
+  pill: (on, color) => ({
+    padding: "6px 10px",
     borderRadius: 999,
-    fontSize: 11,
-    fontWeight: 700,
-    color: "#fff",
-    background: STATUS_COLORS[status] || "#6b7280",
+    border: "1px solid " + (on ? color : "#d1d5db"),
+    background: on ? color : "#fff",
+    color: on ? "#fff" : "#374151",
+    fontSize: 12,
+    fontWeight: 600,
+    cursor: "pointer",
   }),
-  small: { fontSize: 12, color: "#6b7280" },
-  select: { padding: "6px 8px", fontSize: 13, borderRadius: 6, border: "1px solid #d1d5db" },
-  maoBox: {
+  stageBox: (color) => ({
     marginTop: 12,
-    padding: 12,
+    padding: 14,
     borderRadius: 8,
-    background: "#1f2937",
+    background: color,
     color: "#fff",
     textAlign: "center",
-  },
-};
-
-const EMPTY_FORM = {
-  address: "",
-  distressSigns: [],
-  notes: "",
-  arv: "",
-  repairs: "",
-  fee: "",
-  auctionDate: "",
+  }),
 };
 
 export default function PennyRun() {
-  const [tab, setTab] = useState("log");
-  const [leads, setLeads] = useState(loadLeads);
-  const [form, setForm] = useState(EMPTY_FORM);
-  const [gps, setGps] = useState(null);
-  const [statusFilter, setStatusFilter] = useState("all");
-  const [calc, setCalc] = useState({ arv: "", repairs: "", fee: "", percent: "0.70" });
+  const saved = useMemo(loadSaved, []);
+  const [tab, setTab] = useState("board");
+  const [board, setBoard] = useState(saved.board);
+  const [hunt, setHunt] = useState(saved.hunt); // "sku@store" → hunting|found|gone
+  const [finds, setFinds] = useState(saved.finds);
+  const [paste, setPaste] = useState("");
   const [flash, setFlash] = useState("");
+  const [decodePrice, setDecodePrice] = useState("");
+  const [findForm, setFindForm] = useState({ item: "", store: "", shelf: "", register: "", qty: "1" });
 
   useEffect(() => {
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(leads));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ board, hunt, finds }));
     } catch {
-      // storage full/unavailable — the in-memory list still works
+      // storage unavailable — session still works in memory
     }
-  }, [leads]);
+  }, [board, hunt, finds]);
 
   useEffect(() => {
     if (!flash) return;
@@ -174,104 +170,74 @@ export default function PennyRun() {
     return () => clearTimeout(t);
   }, [flash]);
 
-  function grabGps() {
-    if (!navigator.geolocation) return;
-    navigator.geolocation.getCurrentPosition(
-      (pos) => setGps({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
-      () => setGps(null),
-      { enableHighAccuracy: true, timeout: 8000 },
-    );
+  function importBoard() {
+    try {
+      const data = JSON.parse(paste);
+      if (!Array.isArray(data.items)) throw new Error("no items array");
+      setBoard(data);
+      setHunt({});
+      setPaste("");
+      setFlash(`Board loaded: ${data.items.length} item(s)`);
+    } catch (err) {
+      setFlash(`Could not read that JSON (${err.message})`);
+    }
   }
 
-  function toggleSign(key) {
-    setForm((f) => ({
-      ...f,
-      distressSigns: f.distressSigns.includes(key)
-        ? f.distressSigns.filter((s) => s !== key)
-        : [...f.distressSigns, key],
-    }));
+  function setHuntState(key, value) {
+    setHunt((h) => ({ ...h, [key]: value }));
   }
 
-  function saveLead() {
-    if (!form.address.trim()) {
-      setFlash("Address is required");
+  function saveFind() {
+    if (!findForm.item.trim()) {
+      setFlash("Name the item");
       return;
     }
     const num = (v) => (v === "" ? null : Number.parseFloat(v));
-    const now = new Date().toISOString();
-    setLeads((prev) => [
+    setFinds((prev) => [
       {
-        id: `lead_${Date.now()}`,
-        address: form.address.trim(),
-        status: "new",
-        distressSigns: form.distressSigns,
-        notes: form.notes.trim(),
-        arv: num(form.arv),
-        repairs: num(form.repairs),
-        fee: num(form.fee),
-        auctionDate: form.auctionDate || null,
-        lastContact: null,
-        createdAt: now,
-        lat: gps?.lat ?? null,
-        lng: gps?.lng ?? null,
+        id: `find_${Date.now()}`,
+        item: findForm.item.trim(),
+        store: findForm.store.trim() || null,
+        shelfPrice: num(findForm.shelf),
+        registerPrice: num(findForm.register),
+        qty: Number.parseInt(findForm.qty, 10) || 1,
+        ts: new Date().toISOString(),
       },
       ...prev,
     ]);
-    setForm(EMPTY_FORM);
-    setGps(null);
-    setFlash("Lead saved");
+    setFindForm({ item: "", store: findForm.store, shelf: "", register: "", qty: "1" });
+    setFlash("Logged");
   }
 
-  function setStatus(id, status) {
-    const now = new Date().toISOString();
-    setLeads((prev) =>
-      prev.map((l) => (l.id === id ? { ...l, status, lastContact: now } : l)),
-    );
-  }
-
-  function removeLead(id) {
-    setLeads((prev) => prev.filter((l) => l.id !== id));
-  }
-
-  const visibleLeads = useMemo(
-    () => (statusFilter === "all" ? leads : leads.filter((l) => l.status === statusFilter)),
-    [leads, statusFilter],
-  );
-
-  const exportJson = useMemo(
-    () =>
-      JSON.stringify(
-        { version: 1, exportedAt: new Date().toISOString(), leads },
-        null,
-        2,
-      ),
-    [leads],
-  );
-
-  async function copyExport() {
-    try {
-      await navigator.clipboard.writeText(exportJson);
-      setFlash("Copied — save as leads.json for the monitor");
-    } catch {
-      setFlash("Copy failed — select the text below instead");
+  const stores = useMemo(() => {
+    if (!board) return [];
+    const byStore = new Map();
+    for (const item of board.items) {
+      if (!byStore.has(item.store)) byStore.set(item.store, []);
+      byStore.get(item.store).push(item);
     }
-  }
+    for (const list of byStore.values()) list.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+    return [...byStore.entries()];
+  }, [board]);
 
-  const calcResult = mao({ ...calc, percent: Number.parseFloat(calc.percent) || 0.7 });
+  const decoded = decodePrice === "" ? null : stageFor(Number.parseFloat(decodePrice));
+  const findsJson = useMemo(
+    () => JSON.stringify({ version: 1, exportedAt: new Date().toISOString(), finds }, null, 2),
+    [finds],
+  );
 
   return (
     <div style={S.app}>
       <header style={S.header}>
         <h1 style={S.h1}>🪙 PennyRun</h1>
-        <span style={S.tagline}>deals at pennies on the dollar</span>
+        <span style={S.tagline}>ride the ladder down to a penny</span>
       </header>
 
       <nav style={S.tabs}>
         {[
-          ["log", "Log"],
-          ["pipeline", `Pipeline (${leads.length})`],
-          ["calc", "MAO"],
-          ["export", "Export"],
+          ["board", board ? `Board (${board.items.length})` : "Board"],
+          ["decoder", "Decoder"],
+          ["log", `Log (${finds.length})`],
         ].map(([key, label]) => (
           <button key={key} style={S.tab(tab === key)} onClick={() => setTab(key)}>
             {label}
@@ -285,196 +251,192 @@ export default function PennyRun() {
         </div>
       )}
 
-      {tab === "log" && (
-        <div style={S.card}>
-          <label style={S.label}>Address *</label>
-          <input
-            style={S.input}
-            placeholder="412 Fernwood Ave"
-            value={form.address}
-            onChange={(e) => setForm({ ...form, address: e.target.value })}
-          />
-
-          <label style={S.label}>Distress signs</label>
-          <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-            {DISTRESS_SIGNS.map(([key, label]) => (
-              <button
-                key={key}
-                style={S.signBtn(form.distressSigns.includes(key))}
-                onClick={() => toggleSign(key)}
-              >
-                {label}
-              </button>
-            ))}
+      {tab === "board" && (
+        <div>
+          <div style={S.card}>
+            <label style={S.label}>
+              Paste <code>board-export.json</code> from the monitor (`node index.js export`)
+            </label>
+            <textarea
+              style={{ ...S.input, minHeight: 70, fontFamily: "monospace", fontSize: 11 }}
+              placeholder='{"version":1,"items":[...]}'
+              value={paste}
+              onChange={(e) => setPaste(e.target.value)}
+            />
+            <button style={{ ...S.primary, marginTop: 8 }} onClick={importBoard}>
+              Load board
+            </button>
+            {board && (
+              <div style={{ ...S.small, marginTop: 8 }}>
+                Exported {board.exportedAt?.slice(0, 16).replace("T", " ")} · threshold {board.threshold}
+              </div>
+            )}
           </div>
 
-          <label style={S.label}>Notes</label>
-          <textarea
-            style={{ ...S.input, minHeight: 60 }}
-            placeholder="What did you see? Who did you talk to?"
-            value={form.notes}
-            onChange={(e) => setForm({ ...form, notes: e.target.value })}
-          />
+          {!board && (
+            <div style={{ ...S.card, textAlign: "center", color: "#6b7280" }}>
+              No board yet. Run the monitor, export, paste it here, go hunt.
+            </div>
+          )}
 
-          <div style={{ display: "flex", gap: 8 }}>
-            {[
-              ["arv", "Est. ARV $"],
-              ["repairs", "Repairs $"],
-              ["fee", "Your fee $"],
-            ].map(([key, label]) => (
-              <div key={key} style={{ flex: 1 }}>
-                <label style={S.label}>{label}</label>
+          {stores.map(([store, items]) => (
+            <div key={store}>
+              <div style={{ ...S.small, fontWeight: 700, margin: "12px 0 6px" }}>
+                STORE {store} — {items.length} item(s)
+              </div>
+              {items.map((item) => {
+                const key = `${item.sku}@${item.store}`;
+                const state = hunt[key] ?? "hunting";
+                const info = STAGE_INFO[item.stage] ?? STAGE_INFO.full;
+                return (
+                  <div key={key} style={{ ...S.card, opacity: state === "gone" ? 0.55 : 1 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+                      <strong style={{ fontSize: 15 }}>{item.label}</strong>
+                      <span style={S.badge(info.color)}>score {item.score}</span>
+                    </div>
+                    <div style={{ ...S.small, marginTop: 4 }}>
+                      SKU {item.sku} · last ${item.price} · inv {item.inventory ?? "?"} ·{" "}
+                      {info.label}
+                      {item.ripeDate ? ` · ripe ${item.ripeDate}` : ""}
+                    </div>
+                    <div style={{ display: "flex", gap: 6, marginTop: 10 }}>
+                      {HUNT_STATES.map((hs) => (
+                        <button
+                          key={hs}
+                          style={S.pill(state === hs, HUNT_COLORS[hs])}
+                          onClick={() => setHuntState(key, hs)}
+                        >
+                          {hs}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {tab === "decoder" && (
+        <div style={S.card}>
+          <label style={S.label}>Shelf price</label>
+          <input
+            style={{ ...S.input, fontSize: 22, textAlign: "center" }}
+            type="number"
+            inputMode="decimal"
+            step="0.01"
+            placeholder="9.03"
+            value={decodePrice}
+            onChange={(e) => setDecodePrice(e.target.value)}
+          />
+          {decoded && (
+            <div style={S.stageBox(STAGE_INFO[decoded].color)}>
+              <div style={{ fontSize: 20, fontWeight: 800 }}>{STAGE_INFO[decoded].label}</div>
+              <div style={{ fontSize: 13, marginTop: 6, opacity: 0.9 }}>
+                {STAGE_INFO[decoded].advice}
+              </div>
+            </div>
+          )}
+          <div style={{ ...S.small, marginTop: 14, lineHeight: 1.7 }}>
+            <strong>The ladder:</strong>
+            <br />
+            .06 ending — first markdown, the clock starts
+            <br />
+            .03 ending — final markdown; pennies out ~3 weeks later
+            <br />
+            $0.01 — penny. The shelf tag lies; the register doesn't. Scan to confirm.
+          </div>
+        </div>
+      )}
+
+      {tab === "log" && (
+        <div>
+          <div style={S.card}>
+            <label style={S.label}>Item</label>
+            <input
+              style={S.input}
+              placeholder="LED shop light"
+              value={findForm.item}
+              onChange={(e) => setFindForm({ ...findForm, item: e.target.value })}
+            />
+            <div style={{ display: "flex", gap: 8 }}>
+              <div style={{ flex: 1 }}>
+                <label style={S.label}>Store</label>
+                <input
+                  style={S.input}
+                  placeholder="0121"
+                  value={findForm.store}
+                  onChange={(e) => setFindForm({ ...findForm, store: e.target.value })}
+                />
+              </div>
+              <div style={{ flex: 1 }}>
+                <label style={S.label}>Qty</label>
                 <input
                   style={S.input}
                   type="number"
                   inputMode="numeric"
-                  value={form[key]}
-                  onChange={(e) => setForm({ ...form, [key]: e.target.value })}
+                  value={findForm.qty}
+                  onChange={(e) => setFindForm({ ...findForm, qty: e.target.value })}
                 />
               </div>
-            ))}
-          </div>
-
-          <label style={S.label}>Auction date (from NOD / lis pendens, if known)</label>
-          <input
-            style={S.input}
-            type="date"
-            value={form.auctionDate}
-            onChange={(e) => setForm({ ...form, auctionDate: e.target.value })}
-          />
-
-          <div style={{ marginTop: 10, display: "flex", alignItems: "center", gap: 8 }}>
-            <button style={{ ...S.signBtn(!!gps), fontSize: 13 }} onClick={grabGps}>
-              📍 {gps ? `${gps.lat.toFixed(4)}, ${gps.lng.toFixed(4)}` : "Tag GPS location"}
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <div style={{ flex: 1 }}>
+                <label style={S.label}>Shelf price $</label>
+                <input
+                  style={S.input}
+                  type="number"
+                  inputMode="decimal"
+                  step="0.01"
+                  value={findForm.shelf}
+                  onChange={(e) => setFindForm({ ...findForm, shelf: e.target.value })}
+                />
+              </div>
+              <div style={{ flex: 1 }}>
+                <label style={S.label}>Register said $</label>
+                <input
+                  style={S.input}
+                  type="number"
+                  inputMode="decimal"
+                  step="0.01"
+                  value={findForm.register}
+                  onChange={(e) => setFindForm({ ...findForm, register: e.target.value })}
+                />
+              </div>
+            </div>
+            <button style={S.primary} onClick={saveFind}>
+              Log it
             </button>
           </div>
 
-          {mao(form) !== null && (
-            <div style={S.maoBox}>
-              <div style={{ fontSize: 11, opacity: 0.7 }}>MAO (70% rule)</div>
-              <div style={{ fontSize: 22, fontWeight: 800 }}>{money(mao(form))}</div>
-            </div>
-          )}
-
-          <button style={S.primary} onClick={saveLead}>
-            Save lead
-          </button>
-        </div>
-      )}
-
-      {tab === "pipeline" && (
-        <div>
-          <div style={{ ...S.card, display: "flex", alignItems: "center", gap: 8 }}>
-            <span style={S.small}>Filter</span>
-            <select
-              style={S.select}
-              value={statusFilter}
-              onChange={(e) => setStatusFilter(e.target.value)}
-            >
-              <option value="all">All statuses</option>
-              {STATUSES.map((s) => (
-                <option key={s} value={s}>
-                  {STATUS_LABELS[s]}
-                </option>
-              ))}
-            </select>
-          </div>
-
-          {visibleLeads.length === 0 && (
-            <div style={{ ...S.card, textAlign: "center", color: "#6b7280" }}>
-              No leads here yet. Go drive.
-            </div>
-          )}
-
-          {visibleLeads.map((lead) => (
-            <div key={lead.id} style={S.card}>
-              <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
-                <strong style={{ fontSize: 15 }}>{lead.address}</strong>
-                <span style={S.badge(lead.status)}>{STATUS_LABELS[lead.status]}</span>
+          {finds.map((f) => {
+            const pennied = f.registerPrice !== null && Math.round(f.registerPrice * 100) === 1;
+            return (
+              <div key={f.id} style={S.card}>
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+                  <strong>{f.item}</strong>
+                  {pennied && <span style={S.badge("#16a34a")}>PENNY ✕{f.qty}</span>}
+                </div>
+                <div style={{ ...S.small, marginTop: 4 }}>
+                  {f.store ? `store ${f.store} · ` : ""}shelf ${f.shelfPrice ?? "?"} · register $
+                  {f.registerPrice ?? "?"} · {f.ts.slice(0, 16).replace("T", " ")}
+                </div>
               </div>
-              <div style={{ ...S.small, marginTop: 4 }}>
-                {lead.distressSigns
-                  .map((k) => DISTRESS_SIGNS.find(([key]) => key === k)?.[1] ?? k)
-                  .join(" · ") || "No distress signs logged"}
-              </div>
-              {lead.notes && <div style={{ fontSize: 13, marginTop: 6 }}>{lead.notes}</div>}
-              <div style={{ ...S.small, marginTop: 6 }}>
-                MAO {money(mao(lead))}
-                {lead.auctionDate ? ` · Auction ${lead.auctionDate}` : ""}
-                {lead.lat != null ? ` · 📍 ${lead.lat.toFixed(4)}, ${lead.lng.toFixed(4)}` : ""}
-              </div>
-              <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
-                <select
-                  style={{ ...S.select, flex: 1 }}
-                  value={lead.status}
-                  onChange={(e) => setStatus(lead.id, e.target.value)}
-                >
-                  {STATUSES.map((s) => (
-                    <option key={s} value={s}>
-                      {STATUS_LABELS[s]}
-                    </option>
-                  ))}
-                </select>
-                <button
-                  style={{ ...S.signBtn(false), color: "#b91c1c", borderColor: "#fca5a5" }}
-                  onClick={() => {
-                    if (window.confirm(`Delete lead for ${lead.address}?`)) removeLead(lead.id);
-                  }}
-                >
-                  Delete
-                </button>
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
+            );
+          })}
 
-      {tab === "calc" && (
-        <div style={S.card}>
-          {[
-            ["arv", "After-repair value (ARV) $"],
-            ["repairs", "Repair estimate $"],
-            ["fee", "Your wholesale fee $"],
-            ["percent", "Percent (0.70 = 70% rule)"],
-          ].map(([key, label]) => (
-            <div key={key}>
-              <label style={S.label}>{label}</label>
-              <input
-                style={S.input}
-                type="number"
-                inputMode="decimal"
-                step={key === "percent" ? "0.01" : "1000"}
-                value={calc[key]}
-                onChange={(e) => setCalc({ ...calc, [key]: e.target.value })}
+          {finds.length > 0 && (
+            <div style={S.card}>
+              <label style={S.label}>Finds export (copy for your records)</label>
+              <textarea
+                readOnly
+                style={{ ...S.input, minHeight: 120, fontFamily: "monospace", fontSize: 11 }}
+                value={findsJson}
+                onFocus={(e) => e.target.select()}
               />
             </div>
-          ))}
-          <div style={S.maoBox}>
-            <div style={{ fontSize: 11, opacity: 0.7 }}>Maximum allowable offer</div>
-            <div style={{ fontSize: 26, fontWeight: 800 }}>{money(calcResult)}</div>
-            <div style={{ fontSize: 11, opacity: 0.7, marginTop: 4 }}>
-              ARV × percent − repairs − fee
-            </div>
-          </div>
-        </div>
-      )}
-
-      {tab === "export" && (
-        <div style={S.card}>
-          <p style={{ ...S.small, marginTop: 0 }}>
-            {leads.length} lead{leads.length === 1 ? "" : "s"}. Copy this JSON and save it as{" "}
-            <code>leads.json</code>, then run <code>pennyrun-monitor</code> on it. Exports contain
-            addresses and GPS of real properties — keep them out of git and off the internet.
-          </p>
-          <button style={{ ...S.primary, marginTop: 0 }} onClick={copyExport}>
-            Copy export JSON
-          </button>
-          <textarea
-            readOnly
-            style={{ ...S.input, minHeight: 180, marginTop: 10, fontFamily: "monospace", fontSize: 11 }}
-            value={exportJson}
-            onFocus={(e) => e.target.select()}
-          />
+          )}
         </div>
       )}
     </div>

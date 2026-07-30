@@ -1,155 +1,152 @@
 # PennyRun — project guide for Claude Code
 
-Read this file before touching anything else. It is the contract for how this
-project fits together; the code is small on purpose and this file explains why.
+Read this before touching anything. It is the contract for how the pieces fit
+together and which invariants the code is built around.
 
 ## What PennyRun is
 
-PennyRun is a two-part tool for pre-foreclosure wholesalers who hunt deals at
-pennies on the dollar:
+PennyRun hunts retail clearance "pennies": items whose price walks down a
+predictable markdown ladder until the register price is $0.01 and the store is
+supposed to pull them. The cent ending of the price encodes where an item is
+on that ladder (Home Depot cadence, the default):
 
-1. **The field app** (`app/PennyRun.jsx`) — a single-file React app used on a
-   phone while driving for dollars. It logs distressed properties (address,
-   distress signs, GPS, notes), tracks each lead through the pipeline, runs
-   quick MAO math, and exports the whole lead list as JSON.
-2. **The monitor** (`monitor/`) — a zero-dependency Node CLI run at a desk. It
-   reads the JSON export from the field app and reports on the pipeline: leads
-   going stale, auction dates coming up, and status counts.
+| Cent ending | Stage | Meaning |
+| --- | --- | --- |
+| anything else | `full` | not on the ladder |
+| `.06` | `first` | first markdown — the clock starts |
+| `.03` | `final` | final markdown — historically pennies out ~3 weeks later |
+| price = `$0.01` | `penny` | penny — go now |
 
-The two halves never talk over a network. The **leads JSON file is the only
-interface between them** — see "The leads schema" below. That schema is the
-most important invariant in the repo.
+Two halves:
+
+1. **The monitor** (`monitor/`) — a zero-dependency Node CLI that sweeps a
+   watchlist of SKUs × stores through a price provider, diffs each item's
+   ladder stage against history, emits alerts on transitions, predicts ripe
+   dates, and exports a board of ripe items.
+2. **The field app** (`app/PennyRun.jsx`) — React, no build step, renders as
+   a Claude artifact. In-store companion: load the exported board, hunt the
+   list, decode shelf prices, log what the register actually said.
+
+They communicate only through `data/board-export.json`. The ladder is a
+probability model; **the register price is the only truth**.
 
 ## Repo layout
 
 ```
 pennyrun/
-  CLAUDE.md          this file
-  README.md          user-facing overview and quick start
-  .env.example       monitor configuration knobs (copy to .env)
-  package.json       scripts + bin entry for the monitor
+  CLAUDE.md            this file
+  README.md            overview + quick start
+  .env.example         provider keys + provider selection
+  package.json         root scripts (thin wrappers over monitor/index.js)
   app/
-    PennyRun.jsx     the field app — one self-contained React component
+    PennyRun.jsx       field app — one self-contained React component
   monitor/
-    README.md        CLI usage in detail
-    cli.js           entry point (also the `pennyrun-monitor` bin)
-    lib.js           all logic: parsing, MAO, staleness, auctions, stats
-    lib.test.js      node:test suite for lib.js
+    README.md          CLI + config reference
+    index.js           CLI: once | watch | resolve | export
+    config.json        watchlist + knobs (committed; demo values by default)
+    src/ladder.js      PURE functions — cent ending → stage, proximity score, ripe date
+    src/providers.js   serpapi | unwrangle | mock, one interface: lookup() → Reading
+    src/monitor.js     sweep loop, state diffing, alert emission, Claude brief, export
+    test-ladder.js     walks a fake SKU down the ladder, asserts alerts fire in order
+    data/              gitignored: state.json, brief.md, board-export.json
 ```
 
 ## Commands
 
 ```sh
-npm test                      # node --test over monitor/ — no install needed
-npm run monitor               # full report against ./leads.json
-node monitor/cli.js stale ./leads.json --days 5
+cd monitor
+node test-ladder.js       # offline, no keys, verifies scoring end to end — run this first
+node index.js once        # single sweep
+node index.js watch       # loop on config.intervalMinutes
+node index.js resolve SKU # SKU/UPC → internal product id (serpapi only)
+node index.js export      # ripe items → data/board-export.json
 ```
 
-There is no build step and no `npm install`. If you find yourself wanting one,
-stop and re-read "Hard rules" below.
+`npm test` / `npm run once` etc. from the repo root are the same commands.
+There is no `npm install` and no build step anywhere.
 
-## Architecture decisions (do not undo these casually)
+## Architecture invariants (the load-bearing walls)
 
-- **`app/PennyRun.jsx` is deliberately one file with no imports beyond React
-  and only inline styles.** It is designed to be pasted into any React host —
-  a Claude artifact, a Vite scratch project, an existing app — with zero setup.
-  Do not split it into modules, add a CSS file, or introduce a component
-  library. If it grows, grow it inside the one file.
-- **The monitor has zero runtime dependencies.** It uses only `node:` builtins
-  (`fs`, `path`, `process`, `node:test`, `node:assert`). This keeps it
-  runnable on any machine with Node ≥ 18 and nothing else.
-- **All monitor logic lives in `lib.js`; `cli.js` only parses argv/env and
-  prints.** Anything worth testing goes in `lib.js`. Never put logic in
-  `cli.js` that a test would want to reach.
-- **The 70% rule MAO math exists in both halves on purpose.** The app computes
-  it live in the field; the monitor recomputes it from raw numbers in the
-  export. They are kept in sync by the schema (raw `arv`/`repairs`/`fee` are
-  exported, never a precomputed MAO), so duplication is contained. If you
-  change the formula, change it in both `app/PennyRun.jsx` and
-  `monitor/lib.js`, and update the tests.
+- **`src/ladder.js` is pure.** No I/O, no env, no network, no implicit
+  clocks — every time-dependent function takes `now`. All prices go through
+  integer cents (`toCents`) to dodge floating point. If a function needs to
+  fetch or persist, it belongs in `monitor.js` or `providers.js`, not here.
+- **Providers are interchangeable.** Every provider implements
+  `lookup({ sku, store }) → Reading` where
+  `Reading = { sku, store, price, inventory, ts?, source }` with `null` for
+  unknowns. Nothing outside `providers.js` may know which provider is in use
+  (`resolve` being serpapi-only is the single sanctioned exception, enforced
+  in `index.js`). Live-provider field mappings are best-effort — verify
+  against provider docs before trusting live numbers, and fix mappings only
+  in `providers.js`.
+- **The mock provider must never set `ts`.** `sweep()` stamps its own clock;
+  that is what lets `test-ladder.js` replay weeks of readings with an
+  injected `now`. The default (script-less) mock walks each SKU one rung down
+  the ladder per lookup **within a process** — so `watch` demos the full
+  alert sequence offline, while repeated `once` runs stay at full price.
+- **Alerts fire at most once per SKU@store, in ladder order:**
+  `first_markdown → final_markdown → ripe → pennied` (`ALERT_ORDER` in
+  `monitor.js`; `item.alerted` in state is the memory). A straight-to-penny
+  jump still fires the earlier alerts first, same timestamp. A price blip
+  back up never resets stage clocks or re-arms alerts (`stageRank` guard).
+- **State keeps at most `historyDepth` readings (default 40) per SKU@store.**
+  `data/` is gitignored in its entirety; state, briefs, and board exports are
+  operational artifacts, never committed.
+- **One flaky lookup must not kill a sweep.** Provider errors are collected
+  per item and reported at the end.
+- **The app duplicates `stageFor` on purpose** (it must render with no
+  imports beyond React). If the ladder ever changes, change it in
+  `src/ladder.js` and `app/PennyRun.jsx` in the same commit, and update
+  `test-ladder.js` and the Decoder tab's help text.
 
-## The leads schema (version 1)
-
-The field app's "Export" button writes this shape; the monitor's
-`parseLeads()` reads it (and also accepts a bare array of leads):
+## State schema (`monitor/data/state.json`)
 
 ```json
 {
-  "version": 1,
-  "exportedAt": "2026-07-30T15:04:05.000Z",
-  "leads": [
-    {
-      "id": "lead_1722351845000",
-      "address": "412 Fernwood Ave",
-      "status": "contacted",
-      "distressSigns": ["tall_grass", "boarded_windows"],
-      "notes": "Neighbor says owner moved out in spring",
-      "arv": 240000,
-      "repairs": 45000,
-      "fee": 10000,
-      "auctionDate": "2026-08-19",
-      "lastContact": "2026-07-24T18:00:00.000Z",
-      "createdAt": "2026-07-12T16:30:00.000Z",
-      "lat": 33.7489,
-      "lng": -84.3902
+  "lastSweep": "2026-07-30T12:00:00.000Z",
+  "items": {
+    "1004-123-456@0121": {
+      "sku": "1004-123-456",
+      "store": "0121",
+      "label": "LED shop light",
+      "readings": [{ "price": 9.03, "inventory": 4, "ts": "…", "source": "serpapi" }],
+      "stage": "final",
+      "stageSince": { "first": "…", "final": "…" },
+      "alerted": { "first_markdown": "…", "final_markdown": "…" },
+      "score": 88
     }
-  ]
+  }
 }
 ```
 
-Rules:
+`stageSince.final` drives the ripe date (`+ config.ripeDays`, default 21) and
+the score's time component. Scores: penny = 100, final = 55 + up to 30 as the
+ripe date approaches, first = 30, full = 5; inventory 1–5 adds 10, inventory
+0 caps the score at 10 (already pulled). Only a confirmed $0.01 reading may
+score 100.
 
-- `status` is one of: `new`, `contacted`, `negotiating`, `under_contract`,
-  `assigned`, `dead`. `assigned` and `dead` are terminal — the monitor
-  ignores them for staleness and auction warnings.
-- `arv`, `repairs`, `fee` are raw dollars or `null`. Never export a computed
-  MAO; the monitor derives it.
-- `auctionDate` is a date-only string (`YYYY-MM-DD`) or `null`.
-- `lastContact` and `createdAt` are ISO timestamps; `lastContact` may be
-  `null` (staleness then falls back to `createdAt`).
-- Unknown extra fields must be tolerated by the monitor, not stripped —
-  the field app may add fields before the monitor learns about them.
+## API call budget
 
-**Any change to this schema is a breaking change.** Bump `version`, keep
-`parseLeads()` reading the old version, and update this section, both
-READMEs, and the tests in the same commit.
+```
+calls/month = skus × stores × sweeps_per_day × 30
+```
 
-## Domain glossary
-
-- **Driving for dollars** — scouting neighborhoods in person for visibly
-  distressed properties. This is what the field app is for.
-- **Distress signs** — visible indicators (tall grass, boarded windows, code
-  violation notices, full mailbox, tarped roof, apparent vacancy) that a
-  property may have a motivated seller.
-- **NOD / lis pendens** — public pre-foreclosure filings. `auctionDate` on a
-  lead usually comes from these.
-- **ARV** — after-repair value: what the property is worth fixed up.
-- **MAO** — maximum allowable offer. PennyRun uses the 70% rule:
-  `MAO = ARV × 0.70 − repairs − wholesale fee`, floored at 0. The 0.70 is
-  configurable (`PENNYRUN_MAO_PERCENT` for the monitor, an input in the app).
-- **Assignment / wholesale fee** — the wholesaler's profit for assigning the
-  contract to an end buyer.
-
-## Configuration
-
-The monitor reads `.env`-style variables from the real environment (it does
-not load a `.env` file itself — export them or use a wrapper). See
-`.env.example` for the full list: leads-file path, stale-days threshold,
-auction warning window, MAO percent. CLI flags always override env vars.
-
-The field app has no configuration; it persists its state to
-`localStorage` under the key `pennyrun.leads.v1`.
+Every knob in that formula is in `config.json` (`skus`, `stores`,
+`intervalMinutes` ⇒ sweeps/day). `watch` prints the projection at startup —
+check it against your provider plan before leaving it running. Example:
+10 SKUs × 2 stores × 4 sweeps/day × 30 = 2,400 calls/month.
 
 ## Hard rules
 
-- No runtime dependencies anywhere. `package.json` must keep an empty (or
-  absent) `dependencies` block.
-- Do not add a build system, bundler, or framework scaffold. This repo is a
-  component file plus a CLI, and that is the point.
-- Keep `npm test` passing; add or update tests in `monitor/lib.test.js`
-  whenever `monitor/lib.js` changes behavior.
-- Never commit real lead data. `leads.json`, `.env`, and anything under a
-  `data/` directory stay untracked (see `.gitignore`).
-- Addresses, notes, and GPS coordinates in exports are personal data about
-  real homeowners. Never paste real exports into issues, PRs, tests, or docs;
-  use invented fixtures like the example above.
+- `node test-ladder.js` must pass offline with no keys before any push. It is
+  a plain script (no test framework) — exit 0 is the contract.
+- No runtime dependencies, no build system, anywhere. The monitor is `node:`
+  builtins + `fetch`; the app is one JSX file.
+- Never commit `data/`, `.env`, or API keys. `config.json` is committed but
+  must hold only demo/personal-free values in the repo.
+- Data access goes through the provider APIs (serpapi, unwrangle) the user
+  pays for, or the mock. Do not add direct scraping of retailer websites.
+- Keep sweep cadence honest: don't lower `intervalMinutes` below hourly by
+  default, and keep the budget line in `watch` accurate.
+- Penny policy varies by store and pennies are YMMV by design — keep wording
+  in briefs and the app factual ("historically ~3 weeks"), not promissory.
