@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Optional
 
 import httpx
 
-from ..models import Candle, Timeframe
+from ..models import Candle, Quote, Timeframe
 from .base import MarketDataProvider
 
 _TF_MAP = {
@@ -21,6 +22,7 @@ _TF_MAP = {
 
 class AlpacaData(MarketDataProvider):
     name = "alpaca"
+    supports_quotes = True
 
     def __init__(
         self,
@@ -72,11 +74,24 @@ class AlpacaData(MarketDataProvider):
                 break
         return out
 
-    async def latest_quote(self, symbol: str) -> dict:
+    async def latest_quote(self, symbol: str) -> Optional[Quote]:
+        """Latest quote. Payload keys are abbreviated: bp/ap prices, bs/as
+        sizes, t an RFC3339 timestamp."""
         resp = await self._client.get(f"/v2/stocks/{symbol}/quotes/latest")
         resp.raise_for_status()
         q = resp.json().get("quote") or {}
-        return {"bid": q.get("bp"), "ask": q.get("ap")}
+        bid, ask = q.get("bp"), q.get("ap")
+        if bid is None or ask is None:
+            return None
+        raw_ts = q.get("t")
+        if isinstance(raw_ts, str):
+            ts = datetime.fromisoformat(raw_ts.replace("Z", "+00:00")).astimezone(timezone.utc)
+        else:
+            ts = datetime.now(timezone.utc)
+        return Quote(
+            symbol=symbol.upper(), bid=float(bid), ask=float(ask), timestamp=ts,
+            provider=self.name, bid_size=q.get("bs"), ask_size=q.get("as"),
+        )
 
     async def close(self) -> None:
         await self._client.aclose()

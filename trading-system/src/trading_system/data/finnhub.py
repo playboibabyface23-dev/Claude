@@ -22,6 +22,10 @@ _TF_MAP = {
 
 class FinnhubData(MarketDataProvider):
     name = "finnhub"
+    # Finnhub's /quote endpoint returns current/open/high/low/prev-close — no
+    # bid or ask. latest_quote() inherits the base None so the safety layer
+    # sees an honest "unavailable" rather than a spread derived from OHLC.
+    supports_quotes = False
 
     def __init__(self, api_key: str, base_url: str = "https://finnhub.io/api/v1") -> None:
         self._client = httpx.AsyncClient(

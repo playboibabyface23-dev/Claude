@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Optional
 
 import httpx
 
-from ..models import Candle, Timeframe
+from ..models import Candle, Quote, Timeframe
 from .base import MarketDataProvider
 
 _TF_MAP = {
@@ -21,6 +22,7 @@ _TF_MAP = {
 
 class PolygonData(MarketDataProvider):
     name = "polygon"
+    supports_quotes = True
 
     def __init__(self, api_key: str, base_url: str = "https://api.polygon.io") -> None:
         self._client = httpx.AsyncClient(
@@ -50,14 +52,30 @@ class PolygonData(MarketDataProvider):
             for r in results
         ]
 
-    async def latest_quote(self, symbol: str) -> dict:
-        resp = await self._client.get(f"/v3/quotes/{symbol}", params={"limit": 1})
+    async def latest_quote(self, symbol: str) -> Optional[Quote]:
+        """Most recent NBBO tick.
+
+        Uses /v2/last/nbbo rather than /v3/quotes?limit=1 — the v3 listing is
+        not ordered newest-first by default, so limit=1 can return an arbitrary
+        quote from the window. The v2 payload uses abbreviated keys
+        (P=ask, p=bid, S/s=sizes, t=SIP timestamp in nanoseconds).
+        """
+        resp = await self._client.get(f"/v2/last/nbbo/{symbol}")
         resp.raise_for_status()
-        results = resp.json().get("results") or []
-        if not results:
-            return {}
-        q = results[0]
-        return {"bid": q.get("bid_price"), "ask": q.get("ask_price")}
+        q = resp.json().get("results") or {}
+        bid, ask = q.get("p"), q.get("P")
+        if bid is None or ask is None:
+            return None
+        ts_ns = q.get("t")
+        ts = (
+            datetime.fromtimestamp(ts_ns / 1e9, tz=timezone.utc)
+            if isinstance(ts_ns, (int, float))
+            else datetime.now(timezone.utc)
+        )
+        return Quote(
+            symbol=symbol.upper(), bid=float(bid), ask=float(ask), timestamp=ts,
+            provider=self.name, bid_size=q.get("s"), ask_size=q.get("S"),
+        )
 
     async def close(self) -> None:
         await self._client.aclose()

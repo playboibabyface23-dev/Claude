@@ -42,6 +42,9 @@ class RiskLimits:
     max_spread_pct: float = 0.05            # spread as % of price
     max_correlated_positions: int = 1       # per correlation group
     atr_volatility_ceiling: float = 4.0     # reject if ATR% of price exceeds normal x this
+    require_quote: bool = True              # block when no usable bid/ask is available
+    max_quote_age_seconds: float = 60.0     # older than this is treated as no quote
+    min_slippage_headroom: float = 4.0      # stop distance must exceed spread by this factor
 
     @classmethod
     def from_env(cls) -> "RiskLimits":
@@ -54,6 +57,12 @@ class RiskLimits:
             max_open_positions=_env_int("MAX_OPEN_POSITIONS", cls.max_open_positions),
             min_risk_reward=_env_float("MIN_RISK_REWARD", cls.min_risk_reward),
             min_probability=_env_float("MIN_PROBABILITY", cls.min_probability),
+            max_spread_pct=_env_float("MAX_SPREAD_PCT", cls.max_spread_pct),
+            require_quote=os.environ.get("REQUIRE_QUOTE", "true").lower()
+            not in ("false", "0", "no"),
+            max_quote_age_seconds=_env_float(
+                "MAX_QUOTE_AGE_SECONDS", cls.max_quote_age_seconds
+            ),
         )
 
 

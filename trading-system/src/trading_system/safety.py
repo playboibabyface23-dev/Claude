@@ -22,6 +22,7 @@ from typing import Optional
 from .broker.base import Position
 from .config import RiskLimits, Settings
 from .decision import TradeAction, TradeDecision
+from .models import Quote
 
 
 class BreakerState(str, Enum):
@@ -48,8 +49,8 @@ class AccountState:
 class MarketState:
     """Observable market facts for the symbol being traded."""
 
-    bid: Optional[float] = None
-    ask: Optional[float] = None
+    quote: Optional[Quote] = None              # top of book at gate time
+    quote_error: Optional[str] = None          # why the quote is missing, if it is
     atr_pct: Optional[float] = None            # current ATR as % of price
     baseline_atr_pct: Optional[float] = None   # typical ATR% for this symbol
     relative_volume: Optional[float] = None
@@ -148,33 +149,63 @@ class SafetyLayer:
         check("news_events", mins is None or mins > NEWS_BLACKOUT_MINUTES,
               f"high-impact news in {mins} min" if mins is not None else "no events")
 
-        # 3. Spread
-        if market.bid and market.ask and decision.entry:
-            spread_pct = (market.ask - market.bid) / decision.entry * 100
-            check("spread", spread_pct <= self.limits.max_spread_pct,
-                  f"spread {spread_pct:.4f}% vs cap {self.limits.max_spread_pct}%")
+        # 3. Quote usability. Spread and slippage are only as good as the
+        # quote behind them, so validate it once and gate on it explicitly
+        # rather than letting a missing quote silently skip both checks.
+        quote = market.quote
+        if quote is None:
+            quote_detail = market.quote_error or "no quote available"
+        elif not quote.is_valid:
+            quote_detail = (
+                f"crossed book bid={quote.bid} ask={quote.ask}"
+                if quote.crossed else f"invalid quote bid={quote.bid} ask={quote.ask}"
+            )
+        elif quote.is_stale(self.limits.max_quote_age_seconds, now):
+            quote_detail = (
+                f"quote {quote.age_seconds(now):.1f}s old "
+                f"(max {self.limits.max_quote_age_seconds:.0f}s)"
+            )
         else:
-            check("spread", True, "no quote available — skipped")
+            quote_detail = ""
 
-        # 4. Slippage headroom: stop distance must dwarf the spread
-        if market.bid and market.ask and decision.risk_per_unit > 0:
-            spread = market.ask - market.bid
-            check("slippage", decision.risk_per_unit >= 4 * spread,
-                  f"stop distance {decision.risk_per_unit:.5f} vs spread {spread:.5f}")
+        quote_usable = quote_detail == ""
+        if self.limits.require_quote:
+            check("quote_data", quote_usable, quote_detail)
         else:
-            check("slippage", True, "no quote available — skipped")
+            check("quote_data", True,
+                  f"{quote_detail} — not required by policy" if quote_detail else "")
 
-        # 5. Liquidity
+        # 4. Spread
+        if quote_usable:
+            spread_pct = quote.spread_pct(decision.entry)
+            check("spread", spread_pct is not None
+                  and spread_pct <= self.limits.max_spread_pct,
+                  f"spread {spread_pct:.4f}% vs cap {self.limits.max_spread_pct}%"
+                  if spread_pct is not None else "spread not computable")
+        else:
+            check("spread", not self.limits.require_quote, quote_detail)
+
+        # 5. Slippage headroom: stop distance must dwarf the spread, or a
+        # normal fill eats a meaningful share of the risk budget.
+        if quote_usable and decision.risk_per_unit > 0:
+            headroom = self.limits.min_slippage_headroom
+            check("slippage", decision.risk_per_unit >= headroom * quote.spread,
+                  f"stop distance {decision.risk_per_unit:.5f} vs "
+                  f"{headroom:g}x spread {quote.spread * headroom:.5f}")
+        else:
+            check("slippage", not self.limits.require_quote, quote_detail)
+
+        # 6. Liquidity
         rv = market.relative_volume
         check("liquidity", rv is None or rv >= MIN_RELATIVE_VOLUME,
               f"relative volume {rv}")
 
-        # 6. Open position count
+        # 7. Open position count
         check("open_positions",
               len(account.open_positions) < self.limits.max_open_positions,
               f"{len(account.open_positions)} open vs max {self.limits.max_open_positions}")
 
-        # 7. Correlation exposure
+        # 8. Correlation exposure
         symbol = decision.symbol.upper()
         group = self._correlation_group(symbol)
         correlated = [
@@ -185,19 +216,19 @@ class SafetyLayer:
               len(correlated) < self.limits.max_correlated_positions,
               f"{len(correlated)} correlated open positions in group {group or 'n/a'}")
 
-        # 8. Duplicate exposure on the same symbol
+        # 9. Duplicate exposure on the same symbol
         dup = any(p.symbol.upper() == symbol for p in account.open_positions)
         check("duplicate_position", not dup,
               "already holding a position in this symbol" if dup else "")
 
-        # 8b. Position data must be trustworthy. If the broker was unreachable
+        # 9b. Position data must be trustworthy. If the broker was unreachable
         # the position set is journal-only and may be missing positions opened
         # elsewhere, so every position-derived check above is unreliable.
         check("position_data_fresh", not account.positions_degraded,
               "broker unreachable — position set may be incomplete"
               if account.positions_degraded else "")
 
-        # 9. Position size / risk caps
+        # 10. Position size / risk caps
         risk_amount = eq * decision.risk_pct / 100
         size_ok = (
             0 < decision.risk_pct <= self.limits.max_risk_per_trade_pct
@@ -208,15 +239,15 @@ class SafetyLayer:
         check("position_size", size_ok,
               f"risk {decision.risk_pct}% qty {decision.quantity}")
 
-        # 10. Risk:reward
+        # 11. Risk:reward
         check("risk_reward", decision.risk_reward >= self.limits.min_risk_reward,
               f"RR {decision.risk_reward:.2f} vs min {self.limits.min_risk_reward}")
 
-        # 11. Probability floor
+        # 12. Probability floor
         check("probability", decision.probability >= self.limits.min_probability,
               f"p={decision.probability:.2f} vs min {self.limits.min_probability}")
 
-        # 12. Volatility ceiling
+        # 13. Volatility ceiling
         if market.atr_pct and market.baseline_atr_pct:
             ratio = market.atr_pct / market.baseline_atr_pct
             check("volatility", ratio <= self.limits.atr_volatility_ceiling,
@@ -224,7 +255,7 @@ class SafetyLayer:
         else:
             check("volatility", True, "no baseline — skipped")
 
-        # 13. Trading hours / holidays
+        # 14. Trading hours / holidays
         check("trading_hours", market.is_market_open and not market.is_holiday,
               "market closed or holiday" if not market.is_market_open or market.is_holiday else "")
 

@@ -64,6 +64,77 @@ class Candle:
         return self.close < self.open
 
 
+@dataclass(frozen=True)
+class Quote:
+    """A top-of-book bid/ask snapshot.
+
+    Carries its own timestamp because a stale quote is worse than no quote for
+    a spread check — it looks authoritative while describing a market that has
+    moved on.
+    """
+
+    symbol: str
+    bid: float
+    ask: float
+    timestamp: datetime
+    provider: str = ""
+    bid_size: Optional[float] = None
+    ask_size: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        if self.timestamp.tzinfo is None:
+            object.__setattr__(self, "timestamp", self.timestamp.replace(tzinfo=timezone.utc))
+
+    @property
+    def spread(self) -> float:
+        return self.ask - self.bid
+
+    @property
+    def mid(self) -> float:
+        return (self.ask + self.bid) / 2
+
+    @property
+    def crossed(self) -> bool:
+        """bid > ask. Indicates bad data or a market in an auction/halt state."""
+        return self.bid > self.ask
+
+    @property
+    def locked(self) -> bool:
+        """bid == ask. Legal but abnormal; usually a stale or synthetic feed."""
+        return self.bid == self.ask
+
+    @property
+    def is_valid(self) -> bool:
+        return self.bid > 0 and self.ask > 0 and not self.crossed
+
+    def spread_pct(self, reference_price: Optional[float] = None) -> Optional[float]:
+        ref = reference_price if reference_price and reference_price > 0 else self.mid
+        if not ref or ref <= 0:
+            return None
+        return self.spread / ref * 100
+
+    def age_seconds(self, now: Optional[datetime] = None) -> float:
+        now = now or datetime.now(timezone.utc)
+        return (now - self.timestamp).total_seconds()
+
+    def is_stale(self, max_age_seconds: float, now: Optional[datetime] = None) -> bool:
+        age = self.age_seconds(now)
+        # A timestamp meaningfully in the future means clock skew or a bad
+        # parse; treat it as untrustworthy rather than infinitely fresh.
+        return age > max_age_seconds or age < -5.0
+
+    def to_dict(self) -> dict:
+        return {
+            "symbol": self.symbol,
+            "bid": self.bid,
+            "ask": self.ask,
+            "spread": self.spread,
+            "mid": self.mid,
+            "timestamp": self.timestamp.isoformat(),
+            "provider": self.provider,
+        }
+
+
 class SwingKind(str, Enum):
     HIGH = "high"
     LOW = "low"

@@ -5,6 +5,7 @@ import pytest
 from trading_system.broker import Position, PositionSide
 from trading_system.config import RiskLimits, Settings
 from trading_system.decision import TradeAction, TradeDecision, position_size
+from trading_system.models import Quote
 from trading_system.safety import (
     AccountState,
     BreakerState,
@@ -36,9 +37,17 @@ def held(symbol: str, side: PositionSide = PositionSide.LONG) -> Position:
     return Position(symbol=symbol, side=side, quantity=10.0, avg_entry_price=100.0)
 
 
-def calm_market() -> MarketState:
-    return MarketState(bid=99.99, ask=100.01, atr_pct=1.0, baseline_atr_pct=1.0,
-                       relative_volume=1.2, is_market_open=True)
+def quote(bid: float = 99.99, ask: float = 100.01,
+          age_seconds: float = 1.0, symbol: str = "SPY") -> Quote:
+    return Quote(symbol=symbol, bid=bid, ask=ask, provider="test",
+                 timestamp=datetime.now(timezone.utc) - timedelta(seconds=age_seconds))
+
+
+def calm_market(**overrides) -> MarketState:
+    base = dict(quote=quote(), atr_pct=1.0, baseline_atr_pct=1.0,
+                relative_volume=1.2, is_market_open=True)
+    base.update(overrides)
+    return MarketState(**base)
 
 
 def test_clean_setup_is_approved():
@@ -89,10 +98,62 @@ def test_news_blackout_blocks_entry():
 
 
 def test_wide_spread_blocks_entry():
-    market = calm_market()
-    market.bid, market.ask = 99.0, 100.5   # 1.5% spread
+    market = calm_market(quote=quote(bid=99.0, ask=100.5))   # 1.5% spread
     verdict = SafetyLayer(settings()).evaluate(good_decision(), healthy_account(), market)
     assert any(c.name == "spread" for c in verdict.failures)
+
+
+def test_spread_eating_the_stop_blocks_on_slippage():
+    """Spread within the cap but large next to a tight stop: a normal fill
+    would consume a big share of the risk budget."""
+    limits = RiskLimits(account_equity=EQUITY, max_spread_pct=1.0)
+    d = TradeDecision(symbol="SPY", action=TradeAction.BUY, entry=100.0,
+                      stop=99.9, target=100.5, risk_pct=1.0,
+                      quantity=position_size(EQUITY, 1.0, 100.0, 99.9),
+                      probability=0.8)
+    market = calm_market(quote=quote(bid=99.95, ask=100.05))   # 0.10 spread vs 0.10 stop
+    verdict = SafetyLayer(Settings(risk=limits)).evaluate(d, healthy_account(), market)
+    assert any(c.name == "slippage" for c in verdict.failures)
+
+
+def test_missing_quote_blocks_by_default():
+    market = calm_market(quote=None, quote_error="provider has no bid/ask")
+    verdict = SafetyLayer(settings()).evaluate(good_decision(), healthy_account(), market)
+    assert not verdict.approved
+    failed = {c.name for c in verdict.failures}
+    assert "quote_data" in failed
+    # Spread and slippage must not silently pass on a missing quote.
+    assert "spread" in failed and "slippage" in failed
+
+
+def test_missing_quote_allowed_when_policy_opts_out():
+    limits = RiskLimits(account_equity=EQUITY, require_quote=False)
+    market = calm_market(quote=None, quote_error="finnhub has no bid/ask")
+    verdict = SafetyLayer(Settings(risk=limits)).evaluate(
+        good_decision(), healthy_account(), market)
+    assert verdict.approved, verdict.failures
+
+
+def test_stale_quote_is_rejected():
+    market = calm_market(quote=quote(age_seconds=300))   # 5 minutes old
+    verdict = SafetyLayer(settings()).evaluate(good_decision(), healthy_account(), market)
+    assert any(c.name == "quote_data" for c in verdict.failures)
+    assert any("old" in c.detail for c in verdict.failures if c.name == "quote_data")
+
+
+def test_crossed_book_is_rejected():
+    """bid > ask means bad data or a halted/auction market — never trade it."""
+    market = calm_market(quote=quote(bid=100.05, ask=99.95))
+    verdict = SafetyLayer(settings()).evaluate(good_decision(), healthy_account(), market)
+    failed = {c.name: c.detail for c in verdict.failures}
+    assert "quote_data" in failed
+    assert "crossed" in failed["quote_data"]
+
+
+def test_future_dated_quote_is_rejected_as_untrustworthy():
+    market = calm_market(quote=quote(age_seconds=-120))   # clock skew / bad parse
+    verdict = SafetyLayer(settings()).evaluate(good_decision(), healthy_account(), market)
+    assert any(c.name == "quote_data" for c in verdict.failures)
 
 
 def test_max_open_positions_blocks_entry():

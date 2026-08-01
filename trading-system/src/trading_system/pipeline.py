@@ -28,7 +28,7 @@ from .decision import TradeAction, TradeDecision
 from .execution import ExecutionValidator, TradersPostClient, ValidationError
 from .indicators import compute_snapshot
 from .memory import TradeJournal, TradeRecord
-from .models import Timeframe
+from .models import Quote, Timeframe
 from .monitoring import DynamicStopEngine, PositionMonitor
 from .monitoring.stops import ExitReason, TrackedPosition
 from .reasoning import ClaudeClient, ClaudeRefusal, MultiAgentAnalyst
@@ -71,9 +71,31 @@ def build_position_provider(settings: Settings,
     return ReconcilingPositionProvider(journal, broker)
 
 
-async def analyze_once(symbol: str, timeframe: Timeframe,
-                       settings: Settings) -> tuple[TradeDecision, dict]:
-    provider = build_provider(settings)
+async def fetch_quote(provider: MarketDataProvider,
+                      symbol: str) -> tuple[Optional[Quote], Optional[str]]:
+    """Top of book for the safety gate, with the reason on failure.
+
+    Deliberately called at execution time rather than during analysis: the
+    reasoning step runs several LLM calls and can take minutes, so a quote
+    captured before it would routinely be stale by the time the gate runs.
+    """
+    if not provider.supports_quotes:
+        return None, f"{provider.name} does not provide bid/ask"
+    try:
+        quote = await provider.latest_quote(symbol)
+    except Exception as exc:
+        log.error("quote fetch failed for %s: %s", symbol, exc)
+        return None, f"quote fetch failed: {exc}"
+    if quote is None:
+        return None, f"{provider.name} returned no quote for {symbol}"
+    return quote, None
+
+
+async def analyze_once(symbol: str, timeframe: Timeframe, settings: Settings,
+                       provider: Optional[MarketDataProvider] = None
+                       ) -> tuple[TradeDecision, dict]:
+    owned = provider is None
+    provider = provider or build_provider(settings)
     try:
         end = datetime.now(timezone.utc)
         start = end - timedelta(minutes=timeframe.minutes * 400)
@@ -104,12 +126,14 @@ async def analyze_once(symbol: str, timeframe: Timeframe,
             "indicators": snapshot.to_dict(),
         }
     finally:
-        await provider.close()
+        if owned:
+            await provider.close()
 
 
 async def execute_decision(decision: TradeDecision, context: dict,
                            settings: Settings, journal: TradeJournal,
-                           positions: PositionProvider) -> Optional[int]:
+                           positions: PositionProvider,
+                           data_provider: MarketDataProvider) -> Optional[int]:
     """Run the safety gates and submit. Returns the journal trade id on success."""
     safety = SafetyLayer(settings)
 
@@ -118,7 +142,15 @@ async def execute_decision(decision: TradeDecision, context: dict,
         log.warning("position drift: stale=%s untracked=%s",
                     drift.stale_journal_symbols, drift.untracked_broker_symbols)
 
+    quote, quote_error = await fetch_quote(data_provider, decision.symbol)
+    if quote is not None:
+        log.info("quote %s bid=%.5f ask=%.5f spread=%.5f (%.1fs old)",
+                 quote.symbol, quote.bid, quote.ask, quote.spread,
+                 quote.age_seconds())
+
     market = MarketState(
+        quote=quote,
+        quote_error=quote_error,
         atr_pct=context["indicators"].get("atr_pct"),
         relative_volume=context["indicators"].get("relative_volume"),
     )
@@ -163,14 +195,14 @@ def realized_pnl(pos: TrackedPosition, exit_price: float) -> float:
 
 
 async def run_monitor(decision: TradeDecision, trade_id: int, settings: Settings,
-                      timeframe: Timeframe, journal: TradeJournal) -> None:
+                      timeframe: Timeframe, journal: TradeJournal,
+                      provider: MarketDataProvider) -> None:
     """Trail the stop and close the position, journaling the exit.
 
     Journaling the close is load-bearing: an unclosed journal entry counts as an
     open position forever, which would eventually trip the open-position and
     duplicate-symbol gates and block all further trading.
     """
-    provider = build_provider(settings)
     tp = TradersPostClient(settings.traderspost_webhook_url)
 
     async def fetch(symbol_: str):
@@ -196,7 +228,6 @@ async def run_monitor(decision: TradeDecision, trade_id: int, settings: Settings
     try:
         await monitor.run()
     finally:
-        await provider.close()
         await tp.close()
 
 
@@ -216,6 +247,23 @@ async def show_positions(settings: Settings) -> int:
     return 0
 
 
+async def show_quote(settings: Settings, symbol: str) -> int:
+    provider = build_provider(settings)
+    try:
+        quote, error = await fetch_quote(provider, symbol)
+    finally:
+        await provider.close()
+    if quote is None:
+        print(json.dumps({"quote": None, "error": error}, indent=2))
+        return 1
+    payload = quote.to_dict()
+    payload["age_seconds"] = round(quote.age_seconds(), 2)
+    payload["spread_pct_of_mid"] = quote.spread_pct()
+    payload["stale"] = quote.is_stale(settings.risk.max_quote_age_seconds)
+    print(json.dumps(payload, indent=2, default=str))
+    return 0
+
+
 async def main_async(args: argparse.Namespace) -> int:
     settings = Settings.from_env()
     timeframe = Timeframe(args.timeframe)
@@ -223,31 +271,40 @@ async def main_async(args: argparse.Namespace) -> int:
     if args.positions:
         return await show_positions(settings)
 
+    if args.quote:
+        return await show_quote(settings, args.symbol)
+
+    data = build_provider(settings)
     try:
-        decision, context = await analyze_once(args.symbol, timeframe, settings)
-    except ClaudeRefusal as exc:
-        log.error("reasoning declined: %s", exc)
-        return 1
+        try:
+            decision, context = await analyze_once(args.symbol, timeframe,
+                                                   settings, data)
+        except ClaudeRefusal as exc:
+            log.error("reasoning declined: %s", exc)
+            return 1
 
-    print(json.dumps(decision.model_dump(mode="json"), indent=2, default=str))
+        print(json.dumps(decision.model_dump(mode="json"), indent=2, default=str))
 
-    if args.dry_run or decision.action == TradeAction.NO_TRADE:
-        return 0
-    if not args.live:
-        print("(re-run with --live to execute)", file=sys.stderr)
-        return 0
-
-    journal = TradeJournal(settings.journal_db_path)
-    positions = build_position_provider(settings, journal)
-    try:
-        trade_id = await execute_decision(decision, context, settings,
-                                          journal, positions)
-        if trade_id is None:
+        if args.dry_run or decision.action == TradeAction.NO_TRADE:
             return 0
-        await run_monitor(decision, trade_id, settings, timeframe, journal)
+        if not args.live:
+            print("(re-run with --live to execute)", file=sys.stderr)
+            return 0
+
+        journal = TradeJournal(settings.journal_db_path)
+        positions = build_position_provider(settings, journal)
+        try:
+            trade_id = await execute_decision(decision, context, settings,
+                                              journal, positions, data)
+            if trade_id is None:
+                return 0
+            await run_monitor(decision, trade_id, settings, timeframe,
+                              journal, data)
+        finally:
+            await positions.close()
+            journal.close()
     finally:
-        await positions.close()
-        journal.close()
+        await data.close()
     return 0
 
 
@@ -262,6 +319,8 @@ def main() -> int:
                         help="execute approved decisions via TradersPost")
     parser.add_argument("--positions", action="store_true",
                         help="print reconciled broker/journal positions and exit")
+    parser.add_argument("--quote", action="store_true",
+                        help="print the current top-of-book quote and exit")
     args = parser.parse_args()
     if not args.symbol and not args.positions:
         parser.error("--symbol is required unless --positions is given")

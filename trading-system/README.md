@@ -89,9 +89,10 @@ per standard lot gives 1.39 lots — computed by `position_size()`, not by the m
 Every check runs in Python after the AI step and before execution. Any failure
 rejects the trade:
 
-✓ maximum daily loss ✓ news events ✓ spread ✓ slippage ✓ liquidity
-✓ drawdown ✓ open positions ✓ correlation ✓ position size ✓ volatility
-✓ trading hours ✓ risk:reward ✓ probability floor ✓ position data freshness
+✓ maximum daily loss ✓ news events ✓ quote usability ✓ spread ✓ slippage
+✓ liquidity ✓ drawdown ✓ open positions ✓ correlation ✓ position size
+✓ volatility ✓ trading hours ✓ risk:reward ✓ probability floor
+✓ position data freshness
 
 On top of that a circuit breaker returns `TRADING_ALLOWED`, `COOLDOWN`
 (losing-streak cooldown), or `HALTED` (daily / weekly / max-drawdown breach).
@@ -125,6 +126,37 @@ Inspect it any time:
 
 ```bash
 python -m trading_system.pipeline --positions
+```
+
+## Where quotes come from
+
+The spread and slippage checks need a live top-of-book, and the three providers
+differ more than you would expect:
+
+| Provider | Endpoint | Wire format |
+|---|---|---|
+| Polygon | `/v2/last/nbbo/{ticker}` | Single-letter keys (`p` bid, `P` ask), **nanosecond** timestamps |
+| Alpaca | `/v2/stocks/{symbol}/quotes/latest` | Two-letter keys (`bp`, `ap`), RFC3339 timestamps |
+| Finnhub | — | **No bid/ask.** Its `/quote` returns OHLC, so it reports `supports_quotes = False` rather than synthesizing a spread |
+
+Polygon's `/v2/last/nbbo` is used rather than `/v3/quotes?limit=1`, because the
+v3 listing is not ordered newest-first and `limit=1` can return an arbitrary
+quote from the window.
+
+The quote is fetched **at execution time, not during analysis** — the reasoning
+step makes several LLM calls and can take minutes, so a quote captured
+beforehand would routinely be stale by the time the gate runs.
+
+A quote is rejected as unusable when it is missing, older than
+`MAX_QUOTE_AGE_SECONDS`, crossed (`bid > ask`, meaning bad data or a
+halt/auction), non-positive, or dated in the future (clock skew). With
+`REQUIRE_QUOTE=true` (the default) an unusable quote blocks the trade — the
+spread and slippage checks fail rather than silently skipping. Set it false
+only if your provider cannot supply quotes and you accept trading without that
+protection.
+
+```bash
+python -m trading_system.pipeline --symbol SPY --quote
 ```
 
 ## Memory and daily learning
@@ -162,7 +194,7 @@ Execution requires the explicit `--live` flag; anything else is analysis only.
 ## Tests
 
 ```bash
-python -m pytest tests/ -v      # 92 tests, no API keys or network required
+python -m pytest tests/ -v      # 117 tests, no API keys or network required
 ```
 
 Coverage is on the deterministic layers where correctness is checkable:
