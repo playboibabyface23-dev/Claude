@@ -78,7 +78,9 @@ per standard lot gives 1.39 lots — computed by `position_size()`, not by the m
 | Decision | `trading_system.decision` | `TradeDecision` schema + deterministic position sizing |
 | Broker state | `trading_system.broker` | Open positions and live equity from the Alpaca trading API, with journal-derived fallback and drift reconciliation |
 | Account | `trading_system.account` | Assembles `AccountState` from broker + journal + persisted high-water mark |
-| Safety | `trading_system.safety` | 14-point pre-trade checklist + drawdown circuit breaker |
+| Market hours | `trading_system.market_hours` | Alpaca clock + offline NYSE calendar (computed holidays, half days), forex/crypto sessions |
+| News | `trading_system.news` | Minutes to the nearest country-relevant high-impact event |
+| Safety | `trading_system.safety` | 14-point pre-trade checklist + drawdown circuit breaker, all fail-safe |
 | Execution | `trading_system.execution` | Schema/risk/duplicate validator, then the TradersPost webhook client |
 | Monitoring | `trading_system.monitoring` | Position monitor + dynamic stop engine (breakeven, ATR trail, structure trail, auto-close) |
 | Memory | `trading_system.memory` | SQLite journal of every trade and gate decision, plus the daily learning review |
@@ -96,6 +98,40 @@ rejects the trade:
 
 On top of that a circuit breaker returns `TRADING_ALLOWED`, `COOLDOWN`
 (losing-streak cooldown), or `HALTED` (daily / weekly / max-drawdown breach).
+
+### Unknown blocks the trade
+
+A check that passes when its input is missing is not a check. Every check that
+depends on external data has a `require_*` policy deciding what *unavailable*
+means, and all of them default to blocking:
+
+| Policy | Guards | Off means |
+|---|---|---|
+| `REQUIRE_QUOTE` | spread, slippage | Trade without spread/slippage protection |
+| `REQUIRE_NEWS_CHECK` | news blackout | Trade through economic releases |
+| `REQUIRE_MARKET_HOURS` | trading hours | Trade when the session can't be confirmed |
+| `REQUIRE_VOLATILITY_BASELINE` | volatility ceiling | Trade without a volatility reference |
+
+Each failure message names the flag and the missing input, so a blocked trade
+tells you exactly which knob to turn.
+
+**Market hours** come from Alpaca's `/v2/clock` when credentials are set — it
+is authoritative and already knows holidays and early closes. Without it, a
+built-in NYSE calendar computes them offline, including Good Friday (which
+moves with Easter, so a hardcoded list misses it) and the 1pm ET half days that
+a naive 9:30–16:00 rule would trade straight through. Forex and crypto get
+their own calendars; the asset class is inferred from the symbol and can be
+overridden per symbol.
+
+**News proximity** is measured in minutes to the nearest *relevant* high-impact
+event, not "are there events today". Relevance is by country — an RBA decision
+doesn't stop an SPY trade, but a US CPI print does, and both legs of a forex
+pair count. Events that just fired count too: the minutes after a release are
+as violent as the minutes before.
+
+**The volatility baseline** is the median ATR% across the lookback window.
+Median rather than mean so the very spike being tested for cannot drag the
+baseline up to meet itself.
 
 ## Where position truth comes from
 
@@ -194,7 +230,7 @@ Execution requires the explicit `--live` flag; anything else is analysis only.
 ## Tests
 
 ```bash
-python -m pytest tests/ -v      # 117 tests, no API keys or network required
+python -m pytest tests/ -v      # 178 tests, no API keys or network required
 ```
 
 Coverage is on the deterministic layers where correctness is checkable:

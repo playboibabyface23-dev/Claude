@@ -5,6 +5,7 @@ import pytest
 from trading_system.broker import Position, PositionSide
 from trading_system.config import RiskLimits, Settings
 from trading_system.decision import TradeAction, TradeDecision, position_size
+from trading_system.market_hours import MarketStatus
 from trading_system.models import Quote
 from trading_system.safety import (
     AccountState,
@@ -45,7 +46,9 @@ def quote(bid: float = 99.99, ask: float = 100.01,
 
 def calm_market(**overrides) -> MarketState:
     base = dict(quote=quote(), atr_pct=1.0, baseline_atr_pct=1.0,
-                relative_volume=1.2, is_market_open=True)
+                relative_volume=1.2, news_checked=True,
+                high_impact_news_within_minutes=None,
+                market_status=MarketStatus(is_open=True, source="test"))
     base.update(overrides)
     return MarketState(**base)
 
@@ -90,11 +93,40 @@ def test_losing_streak_triggers_cooldown_then_releases():
 
 
 def test_news_blackout_blocks_entry():
-    market = calm_market()
-    market.high_impact_news_within_minutes = 5.0
+    market = calm_market(high_impact_news_within_minutes=5.0)
     verdict = SafetyLayer(settings()).evaluate(good_decision(), healthy_account(), market)
     assert not verdict.approved
     assert any(c.name == "news_events" for c in verdict.failures)
+
+
+def test_news_just_released_also_blocks():
+    """The minutes after a release are as violent as the minutes before."""
+    market = calm_market(high_impact_news_within_minutes=-3.0)
+    verdict = SafetyLayer(settings()).evaluate(good_decision(), healthy_account(), market)
+    assert any(c.name == "news_events" for c in verdict.failures)
+
+
+def test_distant_news_does_not_block():
+    market = calm_market(high_impact_news_within_minutes=180.0)
+    verdict = SafetyLayer(settings()).evaluate(good_decision(), healthy_account(), market)
+    assert verdict.approved, verdict.failures
+
+
+def test_unchecked_news_blocks_by_default():
+    """No calendar configured is 'unknown', not 'clear'."""
+    market = calm_market(news_checked=False)
+    verdict = SafetyLayer(settings()).evaluate(good_decision(), healthy_account(), market)
+    assert not verdict.approved
+    failure = next(c for c in verdict.failures if c.name == "news_events")
+    assert "REQUIRE_NEWS_CHECK" in failure.detail   # tell the user how to proceed
+
+
+def test_unchecked_news_allowed_when_policy_opts_out():
+    limits = RiskLimits(account_equity=EQUITY, require_news_check=False)
+    market = calm_market(news_checked=False)
+    verdict = SafetyLayer(Settings(risk=limits)).evaluate(
+        good_decision(), healthy_account(), market)
+    assert verdict.approved, verdict.failures
 
 
 def test_wide_spread_blocks_entry():
@@ -192,17 +224,54 @@ def test_low_probability_blocks_entry():
 
 
 def test_volatility_spike_blocks_entry():
-    market = calm_market()
-    market.atr_pct, market.baseline_atr_pct = 5.0, 1.0   # 5x normal
+    market = calm_market(atr_pct=5.0, baseline_atr_pct=1.0)   # 5x normal
     verdict = SafetyLayer(settings()).evaluate(good_decision(), healthy_account(), market)
     assert any(c.name == "volatility" for c in verdict.failures)
 
 
+def test_missing_volatility_baseline_blocks_by_default():
+    market = calm_market(baseline_atr_pct=None)
+    verdict = SafetyLayer(settings()).evaluate(good_decision(), healthy_account(), market)
+    assert any(c.name == "volatility" for c in verdict.failures)
+
+
+def test_missing_volatility_baseline_allowed_when_policy_opts_out():
+    limits = RiskLimits(account_equity=EQUITY, require_volatility_baseline=False)
+    market = calm_market(baseline_atr_pct=None)
+    verdict = SafetyLayer(Settings(risk=limits)).evaluate(
+        good_decision(), healthy_account(), market)
+    assert verdict.approved, verdict.failures
+
+
 def test_market_closed_blocks_entry():
-    market = calm_market()
-    market.is_market_open = False
+    market = calm_market(market_status=MarketStatus(
+        is_open=False, reason="after close", source="test"))
     verdict = SafetyLayer(settings()).evaluate(good_decision(), healthy_account(), market)
     assert any(c.name == "trading_hours" for c in verdict.failures)
+
+
+def test_holiday_blocks_entry():
+    market = calm_market(market_status=MarketStatus(
+        is_open=False, is_holiday=True, reason="Good Friday", source="test"))
+    verdict = SafetyLayer(settings()).evaluate(good_decision(), healthy_account(), market)
+    failure = next(c for c in verdict.failures if c.name == "trading_hours")
+    assert "Good Friday" in failure.detail
+
+
+def test_undetermined_market_session_blocks_by_default():
+    """No calendar answered — 'unknown' must not read as 'open'."""
+    market = calm_market(market_status=None)
+    verdict = SafetyLayer(settings()).evaluate(good_decision(), healthy_account(), market)
+    assert not verdict.approved
+    assert any(c.name == "trading_hours" for c in verdict.failures)
+
+
+def test_undetermined_market_session_allowed_when_policy_opts_out():
+    limits = RiskLimits(account_equity=EQUITY, require_market_hours=False)
+    market = calm_market(market_status=None)
+    verdict = SafetyLayer(Settings(risk=limits)).evaluate(
+        good_decision(), healthy_account(), market)
+    assert verdict.approved, verdict.failures
 
 
 def test_oversized_position_blocks_entry():

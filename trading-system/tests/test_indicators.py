@@ -4,6 +4,7 @@ import pytest
 
 from conftest import make_candles
 from trading_system.indicators import (
+    baseline_atr_pct,
     atr,
     classify_kill_zone,
     classify_session,
@@ -70,3 +71,26 @@ def test_compute_snapshot_smoke(trending_up_candles):
     assert snap.atr_14 is not None and snap.atr_14 > 0
     d = snap.to_dict()
     assert d["session"] in {s.value for s in Session}
+
+
+def test_baseline_atr_is_median_not_mean():
+    """A single violent bar must not drag the baseline up to meet itself —
+    otherwise the volatility ratio can never exceed 1."""
+    calm = [(100, 100.5, 99.5, 100)] * 60
+    spike = [(100, 130, 70, 100)]          # one enormous bar
+    candles = make_candles(calm + spike)
+    baseline = baseline_atr_pct(candles)
+    snap = compute_snapshot(candles)
+    assert baseline is not None
+    assert snap.atr_pct > baseline * 2, "spike should tower over the baseline"
+
+
+def test_baseline_atr_needs_enough_history():
+    assert baseline_atr_pct(make_candles([(100, 101, 99, 100)] * 10)) is None
+
+
+def test_snapshot_exposes_volatility_ratio():
+    candles = make_candles([(100, 101, 99, 100.5)] * 80)
+    d = compute_snapshot(candles).to_dict()
+    assert d["baseline_atr_pct"] is not None
+    assert d["volatility_ratio"] == pytest.approx(1.0, abs=0.5)

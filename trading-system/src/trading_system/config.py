@@ -19,6 +19,13 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() not in ("false", "0", "no", "off")
+
+
 def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name, "")
     try:
@@ -45,6 +52,14 @@ class RiskLimits:
     require_quote: bool = True              # block when no usable bid/ask is available
     max_quote_age_seconds: float = 60.0     # older than this is treated as no quote
     min_slippage_headroom: float = 4.0      # stop distance must exceed spread by this factor
+    # Each require_* flag decides what happens when a check's input is
+    # unavailable. True means "unknown blocks the trade"; False downgrades the
+    # check to a logged skip. They exist because the alternative — silently
+    # passing a check whose input is missing — is how a guard becomes decorative.
+    require_market_hours: bool = True       # block when the session can't be confirmed open
+    require_news_check: bool = True         # block when no news calendar is configured
+    require_volatility_baseline: bool = True  # block when ATR baseline can't be computed
+    news_blackout_minutes: float = 30.0     # skip trades this close to a high-impact event
 
     @classmethod
     def from_env(cls) -> "RiskLimits":
@@ -58,10 +73,21 @@ class RiskLimits:
             min_risk_reward=_env_float("MIN_RISK_REWARD", cls.min_risk_reward),
             min_probability=_env_float("MIN_PROBABILITY", cls.min_probability),
             max_spread_pct=_env_float("MAX_SPREAD_PCT", cls.max_spread_pct),
-            require_quote=os.environ.get("REQUIRE_QUOTE", "true").lower()
-            not in ("false", "0", "no"),
+            require_quote=_env_bool("REQUIRE_QUOTE", cls.require_quote),
             max_quote_age_seconds=_env_float(
                 "MAX_QUOTE_AGE_SECONDS", cls.max_quote_age_seconds
+            ),
+            require_market_hours=_env_bool(
+                "REQUIRE_MARKET_HOURS", cls.require_market_hours
+            ),
+            require_news_check=_env_bool(
+                "REQUIRE_NEWS_CHECK", cls.require_news_check
+            ),
+            require_volatility_baseline=_env_bool(
+                "REQUIRE_VOLATILITY_BASELINE", cls.require_volatility_baseline
+            ),
+            news_blackout_minutes=_env_float(
+                "NEWS_BLACKOUT_MINUTES", cls.news_blackout_minutes
             ),
         )
 
@@ -77,6 +103,9 @@ class Settings:
     traderspost_webhook_url: str = ""
     journal_db_path: str = "trades.db"
     risk: RiskLimits = field(default_factory=RiskLimits)
+    # Force an asset class for symbols the classifier guesses wrong,
+    # e.g. {"XAUUSD": "forex"}. Values match market_hours.AssetClass.
+    asset_class_overrides: dict[str, str] = field(default_factory=dict)
     # Symbols considered correlated for the safety layer's correlation check.
     correlation_groups: tuple[tuple[str, ...], ...] = (
         ("EURUSD", "GBPUSD", "AUDUSD", "NZDUSD"),
@@ -93,8 +122,7 @@ class Settings:
             alpaca_key_id=os.environ.get("ALPACA_API_KEY_ID", ""),
             alpaca_secret_key=os.environ.get("ALPACA_API_SECRET_KEY", ""),
             finnhub_api_key=os.environ.get("FINNHUB_API_KEY", ""),
-            alpaca_paper=os.environ.get("ALPACA_PAPER", "true").lower()
-            not in ("false", "0", "no"),
+            alpaca_paper=_env_bool("ALPACA_PAPER", cls.alpaca_paper),
             traderspost_webhook_url=os.environ.get("TRADERSPOST_WEBHOOK_URL", ""),
             journal_db_path=os.environ.get("JOURNAL_DB_PATH", "trades.db"),
             risk=RiskLimits.from_env(),

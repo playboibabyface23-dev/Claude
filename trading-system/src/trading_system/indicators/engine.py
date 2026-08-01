@@ -117,6 +117,29 @@ def relative_volume(candles: Sequence[Candle], lookback: int = 20) -> Optional[f
     return candles[-1].volume / avg
 
 
+def baseline_atr_pct(candles: Sequence[Candle], period: int = 14) -> Optional[float]:
+    """Typical ATR-as-%-of-price across the window, as the median.
+
+    The volatility ceiling needs something to compare the current reading
+    against; without it the check has no baseline and silently passes. The
+    median (not the mean) is used so the very spike being tested for cannot
+    drag the baseline up to meet itself.
+    """
+    series = atr(candles, period)
+    pcts = [
+        a / c.close * 100
+        for a, c in zip(series, candles)
+        if a is not None and c.close > 0
+    ]
+    if len(pcts) < period:
+        return None
+    ordered = sorted(pcts)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2
+
+
 @dataclass(frozen=True)
 class IndicatorSnapshot:
     """One JSON-safe indicator read for the reasoning agents."""
@@ -128,6 +151,7 @@ class IndicatorSnapshot:
     vwap: Optional[float]
     atr_14: Optional[float]
     atr_pct: Optional[float]          # ATR as % of price
+    baseline_atr_pct: Optional[float]  # median ATR% over the window
     relative_volume: Optional[float]
     volume_expansion: bool            # rel volume > 1.5x
     session: Session
@@ -142,6 +166,11 @@ class IndicatorSnapshot:
             "vwap": self.vwap,
             "atr_14": self.atr_14,
             "atr_pct": self.atr_pct,
+            "baseline_atr_pct": self.baseline_atr_pct,
+            "volatility_ratio": (
+                self.atr_pct / self.baseline_atr_pct
+                if self.atr_pct and self.baseline_atr_pct else None
+            ),
             "relative_volume": self.relative_volume,
             "volume_expansion": self.volume_expansion,
             "session": self.session.value,
@@ -168,6 +197,7 @@ def compute_snapshot(candles: Sequence[Candle]) -> IndicatorSnapshot:
         vwap=vw,
         atr_14=a,
         atr_pct=(a / last.close * 100) if a and last.close else None,
+        baseline_atr_pct=baseline_atr_pct(candles),
         relative_volume=rv,
         volume_expansion=bool(rv and rv > 1.5),
         session=classify_session(last.timestamp),

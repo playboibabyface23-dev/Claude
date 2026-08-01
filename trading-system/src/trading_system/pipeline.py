@@ -28,7 +28,9 @@ from .decision import TradeAction, TradeDecision
 from .execution import ExecutionValidator, TradersPostClient, ValidationError
 from .indicators import compute_snapshot
 from .memory import TradeJournal, TradeRecord
+from .market_hours import build_market_hours
 from .models import Quote, Timeframe
+from .news import minutes_to_next_high_impact, parse_finnhub_events
 from .monitoring import DynamicStopEngine, PositionMonitor
 from .monitoring.stops import ExitReason, TrackedPosition
 from .reasoning import ClaudeClient, ClaudeRefusal, MultiAgentAnalyst
@@ -91,6 +93,32 @@ async def fetch_quote(provider: MarketDataProvider,
     return quote, None
 
 
+async def fetch_news_window(settings: Settings, symbol: str,
+                            now: Optional[datetime] = None
+                            ) -> tuple[Optional[float], bool, Optional[str]]:
+    """Minutes to the nearest relevant high-impact event.
+
+    Returns (minutes, checked, error). `checked` is what distinguishes "the
+    calendar answered and there is nothing nearby" from "no calendar was
+    consulted" — collapsing those two into None is what let the blackout pass
+    unconditionally before.
+    """
+    if not settings.finnhub_api_key:
+        return None, False, "no news calendar configured (FINNHUB_API_KEY unset)"
+    now = now or datetime.now(timezone.utc)
+    fh = FinnhubData(settings.finnhub_api_key)
+    try:
+        raw = await fh.economic_calendar(now - timedelta(hours=1),
+                                         now + timedelta(days=1))
+    except Exception as exc:
+        log.error("news calendar query failed: %s", exc)
+        return None, False, f"news calendar query failed: {exc}"
+    finally:
+        await fh.close()
+    events = parse_finnhub_events(raw)
+    return minutes_to_next_high_impact(events, symbol, now), True, None
+
+
 async def analyze_once(symbol: str, timeframe: Timeframe, settings: Settings,
                        provider: Optional[MarketDataProvider] = None
                        ) -> tuple[TradeDecision, dict]:
@@ -148,11 +176,29 @@ async def execute_decision(decision: TradeDecision, context: dict,
                  quote.symbol, quote.bid, quote.ask, quote.spread,
                  quote.age_seconds())
 
+    hours = build_market_hours(settings, decision.symbol)
+    try:
+        status = await hours.status(decision.symbol)
+    finally:
+        await hours.close()
+    log.info("session: open=%s %s (%s)", status.is_open, status.reason, status.source)
+
+    news_minutes, news_checked, news_error = await fetch_news_window(
+        settings, decision.symbol
+    )
+    if news_minutes is not None:
+        log.info("nearest high-impact event: %.0f min", news_minutes)
+
     market = MarketState(
         quote=quote,
         quote_error=quote_error,
         atr_pct=context["indicators"].get("atr_pct"),
+        baseline_atr_pct=context["indicators"].get("baseline_atr_pct"),
         relative_volume=context["indicators"].get("relative_volume"),
+        high_impact_news_within_minutes=news_minutes,
+        news_checked=news_checked,
+        news_error=news_error,
+        market_status=status,
     )
 
     verdict = safety.evaluate(decision, account, market)

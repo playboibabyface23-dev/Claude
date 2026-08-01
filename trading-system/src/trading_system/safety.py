@@ -7,6 +7,11 @@ Checklist (from the design spec):
   maximum daily loss, news events, spread, slippage, liquidity, drawdown,
   open positions, correlation, position size, volatility, trading hours.
 
+Every check that depends on external data has a require_* policy in RiskLimits
+deciding what an *unavailable* input means. The default is that unknown blocks
+the trade, because a check that passes when its input is missing is not a
+check — it is a comment.
+
 Also implements a drawdown circuit breaker with three states
 (TRADING_ALLOWED / COOLDOWN / HALTED) modeled on the drawdown-circuit-breaker
 and pre-trade-discipline-gate patterns from claude-trading-skills.
@@ -22,6 +27,7 @@ from typing import Optional
 from .broker.base import Position
 from .config import RiskLimits, Settings
 from .decision import TradeAction, TradeDecision
+from .market_hours import MarketStatus
 from .models import Quote
 
 
@@ -54,9 +60,12 @@ class MarketState:
     atr_pct: Optional[float] = None            # current ATR as % of price
     baseline_atr_pct: Optional[float] = None   # typical ATR% for this symbol
     relative_volume: Optional[float] = None
-    high_impact_news_within_minutes: Optional[float] = None  # minutes to next event
-    is_market_open: bool = True
-    is_holiday: bool = False
+    # Minutes to the nearest relevant high-impact event. Negative means one
+    # just fired. None means no calendar was consulted — not "no events".
+    high_impact_news_within_minutes: Optional[float] = None
+    news_checked: bool = False                 # a calendar actually answered
+    news_error: Optional[str] = None
+    market_status: Optional[MarketStatus] = None   # None means undetermined
 
 
 @dataclass(frozen=True)
@@ -87,7 +96,6 @@ class SafetyVerdict:
         }
 
 
-NEWS_BLACKOUT_MINUTES = 30.0
 LOSING_STREAK_LIMIT = 2
 COOLDOWN_HOURS = 24.0
 MIN_RELATIVE_VOLUME = 0.3   # dead-liquidity floor
@@ -144,10 +152,22 @@ class SafetyLayer:
         check("circuit_breaker", breaker == BreakerState.TRADING_ALLOWED,
               f"state={breaker.value}")
 
-        # 2. News blackout
+        # 2. News blackout. A None here means no calendar answered, which is
+        # not the same as "no events" — treat it as unknown, not as clear.
         mins = market.high_impact_news_within_minutes
-        check("news_events", mins is None or mins > NEWS_BLACKOUT_MINUTES,
-              f"high-impact news in {mins} min" if mins is not None else "no events")
+        blackout = self.limits.news_blackout_minutes
+        if not market.news_checked:
+            detail = market.news_error or "no news calendar configured"
+            check("news_events", not self.limits.require_news_check,
+                  f"{detail} — set FINNHUB_API_KEY or REQUIRE_NEWS_CHECK=false")
+        elif mins is None:
+            check("news_events", True, "no relevant high-impact events in view")
+        else:
+            # Negative minutes mean an event just fired; the minutes after a
+            # release are as violent as the minutes before.
+            check("news_events", abs(mins) > blackout,
+                  f"high-impact news {'in' if mins >= 0 else 'released'} "
+                  f"{abs(mins):.0f} min (blackout {blackout:.0f} min)")
 
         # 3. Quote usability. Spread and slippage are only as good as the
         # quote behind them, so validate it once and gate on it explicitly
@@ -251,13 +271,25 @@ class SafetyLayer:
         if market.atr_pct and market.baseline_atr_pct:
             ratio = market.atr_pct / market.baseline_atr_pct
             check("volatility", ratio <= self.limits.atr_volatility_ceiling,
-                  f"ATR ratio {ratio:.2f}x baseline")
+                  f"ATR {market.atr_pct:.3f}% is {ratio:.2f}x the "
+                  f"{market.baseline_atr_pct:.3f}% baseline "
+                  f"(cap {self.limits.atr_volatility_ceiling:g}x)")
         else:
-            check("volatility", True, "no baseline — skipped")
+            check("volatility", not self.limits.require_volatility_baseline,
+                  "no ATR baseline — need more history to judge volatility")
 
         # 14. Trading hours / holidays
-        check("trading_hours", market.is_market_open and not market.is_holiday,
-              "market closed or holiday" if not market.is_market_open or market.is_holiday else "")
+        status = market.market_status
+        if status is None or not status.determined:
+            check("trading_hours", not self.limits.require_market_hours,
+                  "market session undetermined")
+        elif status.is_holiday:
+            check("trading_hours", False,
+                  f"holiday: {status.reason} ({status.source})")
+        else:
+            check("trading_hours", status.is_open,
+                  "" if status.is_open
+                  else f"market closed: {status.reason} ({status.source})")
 
         approved = all(c.passed for c in checks)
         return SafetyVerdict(approved, breaker, tuple(checks))
