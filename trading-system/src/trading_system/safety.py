@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 
+from .broker.base import Position
 from .config import RiskLimits, Settings
 from .decision import TradeAction, TradeDecision
 
@@ -37,9 +38,10 @@ class AccountState:
     high_water_mark: float
     daily_pnl: float = 0.0
     weekly_pnl: float = 0.0
-    open_positions: list[dict] = field(default_factory=list)  # {symbol, action, quantity}
+    open_positions: list[Position] = field(default_factory=list)
     consecutive_losses: int = 0
     last_loss_at: Optional[datetime] = None
+    positions_degraded: bool = False   # broker unreachable — position set may be stale
 
 
 @dataclass
@@ -173,21 +175,27 @@ class SafetyLayer:
               f"{len(account.open_positions)} open vs max {self.limits.max_open_positions}")
 
         # 7. Correlation exposure
-        group = self._correlation_group(decision.symbol)
+        symbol = decision.symbol.upper()
+        group = self._correlation_group(symbol)
         correlated = [
             p for p in account.open_positions
-            if p.get("symbol") in group and p.get("symbol") != decision.symbol
+            if p.symbol.upper() in group and p.symbol.upper() != symbol
         ]
         check("correlation",
               len(correlated) < self.limits.max_correlated_positions,
               f"{len(correlated)} correlated open positions in group {group or 'n/a'}")
 
-        # 8. Duplicate direction on same symbol
-        dup = any(
-            p.get("symbol") == decision.symbol for p in account.open_positions
-        )
+        # 8. Duplicate exposure on the same symbol
+        dup = any(p.symbol.upper() == symbol for p in account.open_positions)
         check("duplicate_position", not dup,
               "already holding a position in this symbol" if dup else "")
+
+        # 8b. Position data must be trustworthy. If the broker was unreachable
+        # the position set is journal-only and may be missing positions opened
+        # elsewhere, so every position-derived check above is unreliable.
+        check("position_data_fresh", not account.positions_degraded,
+              "broker unreachable — position set may be incomplete"
+              if account.positions_degraded else "")
 
         # 9. Position size / risk caps
         risk_amount = eq * decision.risk_pct / 100

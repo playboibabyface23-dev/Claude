@@ -63,6 +63,11 @@ CREATE TABLE IF NOT EXISTS daily_reviews (
     stats TEXT,                 -- JSON
     report TEXT                 -- JSON model-written review
 );
+CREATE TABLE IF NOT EXISTS account_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    high_water_mark REAL NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 
@@ -169,6 +174,22 @@ class TradeJournal:
         )
         self._conn.commit()
 
+    def mark_closed_externally(self, trade_id: int,
+                               note: str = "closed outside the system") -> None:
+        """Close a journal entry the broker no longer holds.
+
+        outcome is 'unknown' and pnl stays NULL on purpose: we did not observe
+        the exit, so recording a fabricated 0 PnL would corrupt daily-loss and
+        win-rate statistics. SUM() skips NULLs and the streak query filters to
+        win/loss/breakeven, so an unknown close is counted nowhere.
+        """
+        self._conn.execute(
+            "UPDATE trades SET outcome='unknown', closed_at=?, mistake=? "
+            "WHERE id=? AND closed_at IS NULL",
+            (datetime.now(timezone.utc).isoformat(), note, trade_id),
+        )
+        self._conn.commit()
+
     def record_gate_decision(self, symbol: str, verdict: dict) -> None:
         self._conn.execute(
             "INSERT INTO gate_decisions (created_at, symbol, approved, breaker, verdict) "
@@ -207,6 +228,46 @@ class TradeJournal:
             else:
                 break
         return streak, last_loss
+
+    def open_trades(self) -> list[dict]:
+        """Trades this system opened and has not recorded a close for."""
+        rows = self._conn.execute(
+            "SELECT * FROM trades WHERE closed_at IS NULL AND outcome = 'open' "
+            "ORDER BY opened_at"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def find_open_trade(self, symbol: str) -> Optional[dict]:
+        row = self._conn.execute(
+            "SELECT * FROM trades WHERE closed_at IS NULL AND outcome = 'open' "
+            "AND UPPER(symbol) = ? ORDER BY opened_at DESC LIMIT 1",
+            (symbol.upper(),),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def high_water_mark(self, default: float = 0.0) -> float:
+        row = self._conn.execute(
+            "SELECT high_water_mark FROM account_state WHERE id = 1"
+        ).fetchone()
+        return float(row["high_water_mark"]) if row else default
+
+    def update_high_water_mark(self, equity: float) -> float:
+        """Ratchet the high-water mark upward; returns the current mark.
+
+        Without persistence the drawdown check compares equity to itself and
+        can never fire.
+        """
+        current = self.high_water_mark(default=equity)
+        mark = max(current, equity)
+        self._conn.execute(
+            "INSERT INTO account_state (id, high_water_mark, updated_at) "
+            "VALUES (1, ?, ?) ON CONFLICT(id) DO UPDATE SET "
+            "high_water_mark = excluded.high_water_mark, "
+            "updated_at = excluded.updated_at",
+            (mark, datetime.now(timezone.utc).isoformat()),
+        )
+        self._conn.commit()
+        return mark
 
     def trades_on(self, day: date) -> list[dict]:
         start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)

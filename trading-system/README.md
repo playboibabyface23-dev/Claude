@@ -76,7 +76,9 @@ per standard lot gives 1.39 lots — computed by `position_size()`, not by the m
 | Reasoning | `trading_system.reasoning` | The seven agents above, on Claude Fable 5 with structured outputs |
 | Vision | `trading_system.reasoning.vision` | Chart screenshot analysis — trend, BOS, CHOCH, liquidity, OBs, FVGs, entry/stop/target, with an explanation |
 | Decision | `trading_system.decision` | `TradeDecision` schema + deterministic position sizing |
-| Safety | `trading_system.safety` | 13-point pre-trade checklist + drawdown circuit breaker |
+| Broker state | `trading_system.broker` | Open positions and live equity from the Alpaca trading API, with journal-derived fallback and drift reconciliation |
+| Account | `trading_system.account` | Assembles `AccountState` from broker + journal + persisted high-water mark |
+| Safety | `trading_system.safety` | 14-point pre-trade checklist + drawdown circuit breaker |
 | Execution | `trading_system.execution` | Schema/risk/duplicate validator, then the TradersPost webhook client |
 | Monitoring | `trading_system.monitoring` | Position monitor + dynamic stop engine (breakeven, ATR trail, structure trail, auto-close) |
 | Memory | `trading_system.memory` | SQLite journal of every trade and gate decision, plus the daily learning review |
@@ -89,10 +91,41 @@ rejects the trade:
 
 ✓ maximum daily loss ✓ news events ✓ spread ✓ slippage ✓ liquidity
 ✓ drawdown ✓ open positions ✓ correlation ✓ position size ✓ volatility
-✓ trading hours ✓ risk:reward ✓ probability floor
+✓ trading hours ✓ risk:reward ✓ probability floor ✓ position data freshness
 
 On top of that a circuit breaker returns `TRADING_ALLOWED`, `COOLDOWN`
 (losing-streak cooldown), or `HALTED` (daily / weekly / max-drawdown breach).
+
+## Where position truth comes from
+
+TradersPost routes orders but reports no state — its docs say it "does not
+currently provide broker or exchange order IDs, position state, or
+account-level information" and direct you to the broker API. So positions come
+from one of two sources:
+
+| Configured | Source | Sees |
+|---|---|---|
+| Alpaca trading credentials | `GET /v2/positions`, `GET /v2/account` | Everything the account holds, including positions opened by hand or another strategy |
+| TradersPost only | The local trade journal | Only what this system opened and has not closed |
+
+The reconciler prefers the broker and cross-checks the journal against it:
+
+- **Stale journal entry** (journal says open, broker doesn't hold it) is healed
+  — closed with outcome `unknown` and a `NULL` PnL, since the exit wasn't
+  observed and a fabricated zero would corrupt daily-loss and win-rate stats.
+  Left unhealed these accumulate and eventually block all trading.
+- **Untracked broker position** (broker holds it, journal doesn't know) is
+  surfaced but *not* healed — it consumes real buying power and correlation
+  budget, so it counts against the limits.
+- **Broker unreachable** falls back to journal state and sets
+  `positions_degraded`, which fails the `position_data_fresh` check. An
+  unreachable broker must not look like a flat book.
+
+Inspect it any time:
+
+```bash
+python -m trading_system.pipeline --positions
+```
 
 ## Memory and daily learning
 
@@ -129,7 +162,7 @@ Execution requires the explicit `--live` flag; anything else is analysis only.
 ## Tests
 
 ```bash
-python -m pytest tests/ -v      # 69 tests, no API keys or network required
+python -m pytest tests/ -v      # 92 tests, no API keys or network required
 ```
 
 Coverage is on the deterministic layers where correctness is checkable:

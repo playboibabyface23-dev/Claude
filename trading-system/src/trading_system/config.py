@@ -64,6 +64,7 @@ class Settings:
     alpaca_key_id: str = ""
     alpaca_secret_key: str = ""
     finnhub_api_key: str = ""
+    alpaca_paper: bool = True   # trading host: paper-api vs api.alpaca.markets
     traderspost_webhook_url: str = ""
     journal_db_path: str = "trades.db"
     risk: RiskLimits = field(default_factory=RiskLimits)
@@ -83,6 +84,8 @@ class Settings:
             alpaca_key_id=os.environ.get("ALPACA_API_KEY_ID", ""),
             alpaca_secret_key=os.environ.get("ALPACA_API_SECRET_KEY", ""),
             finnhub_api_key=os.environ.get("FINNHUB_API_KEY", ""),
+            alpaca_paper=os.environ.get("ALPACA_PAPER", "true").lower()
+            not in ("false", "0", "no"),
             traderspost_webhook_url=os.environ.get("TRADERSPOST_WEBHOOK_URL", ""),
             journal_db_path=os.environ.get("JOURNAL_DB_PATH", "trades.db"),
             risk=RiskLimits.from_env(),

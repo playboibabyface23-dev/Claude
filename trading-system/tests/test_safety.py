@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from trading_system.broker import Position, PositionSide
 from trading_system.config import RiskLimits, Settings
 from trading_system.decision import TradeAction, TradeDecision, position_size
 from trading_system.safety import (
@@ -29,6 +30,10 @@ def good_decision() -> TradeDecision:
 
 def healthy_account() -> AccountState:
     return AccountState(equity=EQUITY, high_water_mark=EQUITY)
+
+
+def held(symbol: str, side: PositionSide = PositionSide.LONG) -> Position:
+    return Position(symbol=symbol, side=side, quantity=10.0, avg_entry_price=100.0)
 
 
 def calm_market() -> MarketState:
@@ -92,21 +97,21 @@ def test_wide_spread_blocks_entry():
 
 def test_max_open_positions_blocks_entry():
     acct = healthy_account()
-    acct.open_positions = [{"symbol": "AAPL"}, {"symbol": "MSFT"}]
+    acct.open_positions = [held("AAPL"), held("MSFT")]
     verdict = SafetyLayer(settings()).evaluate(good_decision(), acct, calm_market())
     assert any(c.name == "open_positions" for c in verdict.failures)
 
 
 def test_correlated_exposure_blocks_entry():
     acct = healthy_account()
-    acct.open_positions = [{"symbol": "QQQ"}]   # same group as SPY
+    acct.open_positions = [held("QQQ")]   # same group as SPY
     verdict = SafetyLayer(settings()).evaluate(good_decision(), acct, calm_market())
     assert any(c.name == "correlation" for c in verdict.failures)
 
 
 def test_duplicate_symbol_position_blocks_entry():
     acct = healthy_account()
-    acct.open_positions = [{"symbol": "SPY"}]
+    acct.open_positions = [held("SPY")]
     verdict = SafetyLayer(settings()).evaluate(good_decision(), acct, calm_market())
     assert any(c.name == "duplicate_position" for c in verdict.failures)
 
@@ -143,6 +148,24 @@ def test_oversized_position_blocks_entry():
     d = good_decision().model_copy(update={"quantity": 5_000.0})  # implies $5k risk
     verdict = SafetyLayer(settings()).evaluate(d, healthy_account(), calm_market())
     assert any(c.name == "position_size" for c in verdict.failures)
+
+
+def test_degraded_position_data_blocks_entry():
+    """If the broker was unreachable the position set is journal-only, so every
+    position-derived check is unreliable and the trade must not proceed."""
+    acct = healthy_account()
+    acct.positions_degraded = True
+    verdict = SafetyLayer(settings()).evaluate(good_decision(), acct, calm_market())
+    assert not verdict.approved
+    assert any(c.name == "position_data_fresh" for c in verdict.failures)
+
+
+def test_untracked_broker_position_counts_against_limits():
+    """A position opened outside this system still consumes risk budget."""
+    acct = healthy_account()
+    acct.open_positions = [held("SPY", PositionSide.SHORT)]
+    verdict = SafetyLayer(settings()).evaluate(good_decision(), acct, calm_market())
+    assert any(c.name == "duplicate_position" for c in verdict.failures)
 
 
 def test_verdict_is_json_serializable():
