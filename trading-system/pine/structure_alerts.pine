@@ -1,0 +1,62 @@
+//@version=5
+// Structure alerts: fires webhook alerts on BOS / CHOCH so TradingView can act
+// as an event source for the Python pipeline. Point the alert webhook at your
+// receiver; the message body is JSON parsed by
+// trading_system.data.tradingview.parse_tradingview_webhook.
+indicator("Structure Alerts (BOS/CHOCH)", overlay=true, max_labels_count=200)
+
+swingLen = input.int(2, "Swing lookback", minval=1)
+
+swingHigh = ta.pivothigh(high, swingLen, swingLen)
+swingLow  = ta.pivotlow(low, swingLen, swingLen)
+
+var float lastHigh = na
+var float lastLow  = na
+var int   trend    = 0   // 1 bullish, -1 bearish, 0 neutral
+
+if not na(swingHigh)
+    lastHigh := swingHigh
+if not na(swingLow)
+    lastLow := swingLow
+
+bosBull   = false
+bosBear   = false
+chochBull = false
+chochBear = false
+
+if not na(lastHigh) and close > lastHigh
+    if trend >= 0
+        bosBull := true
+    else
+        chochBull := true
+    trend := 1
+    lastHigh := na
+
+if not na(lastLow) and close < lastLow
+    if trend <= 0
+        bosBear := true
+    else
+        chochBear := true
+    trend := -1
+    lastLow := na
+
+plotshape(bosBull,   style=shape.triangleup,   location=location.belowbar, color=color.green, size=size.tiny, title="BOS up")
+plotshape(bosBear,   style=shape.triangledown, location=location.abovebar, color=color.red,   size=size.tiny, title="BOS down")
+plotshape(chochBull, style=shape.diamond,      location=location.belowbar, color=color.lime,  size=size.tiny, title="CHOCH up")
+plotshape(chochBear, style=shape.diamond,      location=location.abovebar, color=color.maroon, size=size.tiny, title="CHOCH down")
+
+msg(event) =>
+    '{"symbol":"' + syminfo.ticker + '","timeframe":"' + timeframe.period +
+     '","event":"' + event + '","price":' + str.tostring(close) +
+     ',"time":"' + str.format_time(time, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC") + '"}'
+
+alertcondition(bosBull or bosBear or chochBull or chochBear, "Structure event", "structure event")
+
+if bosBull
+    alert(msg("bos_bullish"), alert.freq_once_per_bar_close)
+if bosBear
+    alert(msg("bos_bearish"), alert.freq_once_per_bar_close)
+if chochBull
+    alert(msg("choch_bullish"), alert.freq_once_per_bar_close)
+if chochBear
+    alert(msg("choch_bearish"), alert.freq_once_per_bar_close)

@@ -1,0 +1,24 @@
+[project]
+name = "trading-system"
+version = "0.1.0"
+description = "Structure-aware AI trading pipeline: market data -> structure/indicators -> Claude Fable 5 multi-agent reasoning -> TradersPost execution -> dynamic stop management"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.120",
+    "httpx>=0.27",
+    "pydantic>=2.7",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
