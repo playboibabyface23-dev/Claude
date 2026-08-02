@@ -84,6 +84,7 @@ per standard lot gives 1.39 lots — computed by `position_size()`, not by the m
 | Execution | `trading_system.execution` | Schema/risk/duplicate validator, then the TradersPost webhook client |
 | Monitoring | `trading_system.monitoring` | Position monitor + dynamic stop engine (breakeven, ATR trail, structure trail, auto-close) |
 | Memory | `trading_system.memory` | SQLite journal of every trade and gate decision, plus the daily learning review |
+| Backtest | `trading_system.backtest` | Replays history through the real structure, safety, and stop engines with look-ahead and cost controls |
 | Dashboard | `trading_system.dashboard` | Control room: gate ledger, positions, analysis, agent reasoning, policy, journal |
 | Pine Script | `pine/structure_alerts.pine` | TradingView indicator firing BOS/CHOCH webhook alerts as an event source |
 
@@ -196,6 +197,41 @@ protection.
 python -m trading_system.pipeline --symbol SPY --quote
 ```
 
+## Backtesting
+
+```bash
+python -m trading_system.backtest --symbol SPY --timeframe 5m --days 30
+python -m trading_system.backtest --symbol SPY --csv bars.csv --json out.json
+python -m trading_system.backtest --symbol SPY --days 30 --no-gates   # see what the gates filter
+```
+
+**This does not backtest the AI.** The reasoning layer is replaced by a
+deterministic reference strategy scoring the same structural primitives the
+agents reason over. Claude will read that structure differently, and no result
+here transfers to the live agent. What it *does* test is the plumbing: the real
+`StructureEngine`, `SafetyLayer`, and `DynamicStopEngine` are driven directly,
+so the backtest exercises production code rather than a parallel
+reimplementation.
+
+The bias controls matter more than the metrics, because they are how backtests
+lie:
+
+| Control | Why |
+|---|---|
+| Decisions see `candles[:i+1]` only | No look-ahead |
+| Fills at bar *i+1*'s open | The close that produced the signal isn't tradable once you've seen it close |
+| Stop assumed before target | When one bar spans both, OHLC can't order them — reported as `ambiguous_bars` |
+| Spread + slippage charged both ways | Costs are the difference between an edge and a fee |
+| Positions open at the end are marked | Never counted as a win at the last close |
+
+Four gates can't be evaluated from historical candles — news, quote, spread,
+slippage — so they're skipped and **named in the report** rather than silently
+faked. The report leads with those limitations, and flags samples under 30
+trades as a wiring check rather than evidence.
+
+The signal funnel is usually the most useful output: how many signals fired,
+how many each gate rejected, and what actually got taken.
+
 ## Control room
 
 ```bash
@@ -257,7 +293,7 @@ Execution requires the explicit `--live` flag; anything else is analysis only.
 ## Tests
 
 ```bash
-python -m pytest tests/ -v      # 195 tests, no API keys or network required
+python -m pytest tests/ -v      # 213 tests, no API keys or network required
 ```
 
 Coverage is on the deterministic layers where correctness is checkable:
