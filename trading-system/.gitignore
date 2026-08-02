@@ -11,3 +11,7 @@ build/
 dist/
 charts/
 reports/
+
+# Generated dashboard snapshots (regenerate: scripts/demo_dashboard.py)
+dashboard-preview.html
+dashboard.html

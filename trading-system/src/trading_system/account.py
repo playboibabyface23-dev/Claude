@@ -48,7 +48,10 @@ async def build_account_state(
     if broker_account is not None:
         equity = broker_account.equity
     else:
-        equity = settings.risk.account_equity + weekly_pnl
+        # All-time realized PnL, not week-to-date: a rolling window would reset
+        # equity to the starting balance each Monday and make a long drawdown
+        # invisible to the drawdown check.
+        equity = settings.risk.account_equity + journal.realized_pnl_all_time()
 
     high_water_mark = journal.update_high_water_mark(equity)
     streak, last_loss = journal.consecutive_losses()

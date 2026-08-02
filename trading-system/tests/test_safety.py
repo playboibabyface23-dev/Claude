@@ -48,7 +48,8 @@ def calm_market(**overrides) -> MarketState:
     base = dict(quote=quote(), atr_pct=1.0, baseline_atr_pct=1.0,
                 relative_volume=1.2, news_checked=True,
                 high_impact_news_within_minutes=None,
-                market_status=MarketStatus(is_open=True, source="test"))
+                market_status=MarketStatus(is_open=True, source="test"),
+                last_candle_age_seconds=60.0, expected_bar_seconds=300.0)
     base.update(overrides)
     return MarketState(**base)
 
@@ -303,3 +304,36 @@ def test_verdict_is_json_serializable():
 
     verdict = SafetyLayer(settings()).evaluate(good_decision(), healthy_account(), calm_market())
     json.dumps(verdict.to_dict())
+
+
+def test_stale_feed_during_open_session_blocks_as_possible_halt():
+    """A calendar cannot know about a halt or a dead feed; silent data during
+    an open session is the observable symptom of both."""
+    market = calm_market(last_candle_age_seconds=3600, expected_bar_seconds=300)
+    verdict = SafetyLayer(settings()).evaluate(good_decision(), healthy_account(), market)
+    assert not verdict.approved
+    failure = next(c for c in verdict.failures if c.name == "data_heartbeat")
+    assert "halt" in failure.detail
+
+
+def test_fresh_feed_passes_heartbeat():
+    market = calm_market(last_candle_age_seconds=120, expected_bar_seconds=300)
+    verdict = SafetyLayer(settings()).evaluate(good_decision(), healthy_account(), market)
+    assert verdict.approved, verdict.failures
+
+
+def test_heartbeat_not_applied_when_session_closed():
+    """Stale data outside a session is expected, not a halt signal."""
+    market = calm_market(
+        market_status=MarketStatus(is_open=False, reason="after close", source="test"),
+        last_candle_age_seconds=50_000, expected_bar_seconds=300)
+    verdict = SafetyLayer(settings()).evaluate(good_decision(), healthy_account(), market)
+    names = {c.name for c in verdict.failures}
+    assert "data_heartbeat" not in names
+    assert "trading_hours" in names
+
+
+def test_heartbeat_tolerates_one_slow_bar():
+    market = calm_market(last_candle_age_seconds=700, expected_bar_seconds=300)
+    verdict = SafetyLayer(settings()).evaluate(good_decision(), healthy_account(), market)
+    assert verdict.approved, verdict.failures

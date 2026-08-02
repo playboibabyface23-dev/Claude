@@ -30,7 +30,12 @@ from .indicators import compute_snapshot
 from .memory import TradeJournal, TradeRecord
 from .market_hours import build_market_hours
 from .models import Quote, Timeframe
-from .news import minutes_to_next_high_impact, parse_finnhub_events
+from .news import (
+    load_calendar_file,
+    minutes_to_next_high_impact,
+    parse_finnhub_events,
+    recurring_us_macro_events,
+)
 from .monitoring import DynamicStopEngine, PositionMonitor
 from .monitoring.stops import ExitReason, TrackedPosition
 from .reasoning import ClaudeClient, ClaudeRefusal, MultiAgentAnalyst
@@ -103,20 +108,51 @@ async def fetch_news_window(settings: Settings, symbol: str,
     consulted" — collapsing those two into None is what let the blackout pass
     unconditionally before.
     """
-    if not settings.finnhub_api_key:
-        return None, False, "no news calendar configured (FINNHUB_API_KEY unset)"
     now = now or datetime.now(timezone.utc)
-    fh = FinnhubData(settings.finnhub_api_key)
-    try:
-        raw = await fh.economic_calendar(now - timedelta(hours=1),
-                                         now + timedelta(days=1))
-    except Exception as exc:
-        log.error("news calendar query failed: %s", exc)
-        return None, False, f"news calendar query failed: {exc}"
-    finally:
-        await fh.close()
-    events = parse_finnhub_events(raw)
-    return minutes_to_next_high_impact(events, symbol, now), True, None
+    events: list = []
+    sources: list[str] = []
+    errors: list[str] = []
+
+    # 1. Rule-schedulable US releases — no provider needed.
+    if settings.use_recurring_macro_events:
+        events.extend(recurring_us_macro_events(now))
+        sources.append("recurring")
+
+    # 2. A user-maintained file, for the announced-date releases (CPI, FOMC)
+    #    that cannot be derived.
+    if settings.news_calendar_file:
+        try:
+            events.extend(load_calendar_file(settings.news_calendar_file))
+            sources.append("file")
+        except Exception as exc:
+            log.error("news calendar file unreadable: %s", exc)
+            errors.append(f"calendar file: {exc}")
+
+    # 3. Finnhub, when configured.
+    if settings.finnhub_api_key:
+        fh = FinnhubData(settings.finnhub_api_key)
+        try:
+            raw = await fh.economic_calendar(now - timedelta(hours=1),
+                                             now + timedelta(days=1))
+            events.extend(parse_finnhub_events(raw))
+            sources.append("finnhub")
+        except Exception as exc:
+            log.error("news calendar query failed: %s", exc)
+            errors.append(f"finnhub: {exc}")
+        finally:
+            await fh.close()
+
+    if not sources:
+        detail = "; ".join(errors) if errors else (
+            "no news source — set FINNHUB_API_KEY, NEWS_CALENDAR_FILE, "
+            "or leave USE_RECURRING_MACRO_EVENTS on"
+        )
+        return None, False, detail
+
+    log.info("news sources: %s (%d events)", "+".join(sources), len(events))
+    return minutes_to_next_high_impact(events, symbol, now), True, (
+        "; ".join(errors) if errors else None
+    )
 
 
 async def analyze_once(symbol: str, timeframe: Timeframe, settings: Settings,
@@ -152,6 +188,11 @@ async def analyze_once(symbol: str, timeframe: Timeframe, settings: Settings,
             "agent_reads": reads,
             "structure": structure_state.summary(snapshot.price),
             "indicators": snapshot.to_dict(),
+            # Feed liveness, for the data-heartbeat check.
+            "last_candle_age_seconds": (
+                datetime.now(timezone.utc) - candles[-1].timestamp
+            ).total_seconds(),
+            "expected_bar_seconds": timeframe.minutes * 60,
         }
     finally:
         if owned:
@@ -199,6 +240,8 @@ async def execute_decision(decision: TradeDecision, context: dict,
         news_checked=news_checked,
         news_error=news_error,
         market_status=status,
+        last_candle_age_seconds=context.get("last_candle_age_seconds"),
+        expected_bar_seconds=context.get("expected_bar_seconds"),
     )
 
     verdict = safety.evaluate(decision, account, market)

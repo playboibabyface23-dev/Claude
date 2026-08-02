@@ -66,6 +66,11 @@ class MarketState:
     news_checked: bool = False                 # a calendar actually answered
     news_error: Optional[str] = None
     market_status: Optional[MarketStatus] = None   # None means undetermined
+    # Age of the most recent candle. A calendar knows scheduled closures but
+    # not halts, LULD pauses, or a dead feed — during a session that claims to
+    # be open, silent data is the observable symptom of all three.
+    last_candle_age_seconds: Optional[float] = None
+    expected_bar_seconds: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -290,6 +295,23 @@ class SafetyLayer:
             check("trading_hours", status.is_open,
                   "" if status.is_open
                   else f"market closed: {status.reason} ({status.source})")
+
+        # 15. Data heartbeat. A calendar cannot know about a trading halt, an
+        # LULD pause, or a broken feed — but all three look the same from here:
+        # the session claims to be open and the data has stopped arriving.
+        session_open = bool(status and status.is_open and not status.is_holiday)
+        age = market.last_candle_age_seconds
+        if not session_open:
+            check("data_heartbeat", True, "session not open — heartbeat not applicable")
+        elif age is None:
+            check("data_heartbeat", not self.limits.require_market_hours,
+                  "no candle timestamp to verify the feed is live")
+        else:
+            bar = market.expected_bar_seconds or 300.0
+            limit = max(bar * self.limits.stale_bar_multiple, 120.0)
+            check("data_heartbeat", age <= limit,
+                  f"last bar {age:.0f}s old vs {limit:.0f}s limit — "
+                  f"possible halt, LULD pause, or dead feed")
 
         approved = all(c.passed for c in checks)
         return SafetyVerdict(approved, breaker, tuple(checks))

@@ -204,6 +204,19 @@ class TradeJournal:
 
     # ------------------------------------------------------------- reads
 
+    def realized_pnl_all_time(self) -> float:
+        """Every closed trade's PnL.
+
+        Equity must be derived from this, not from the week-to-date figure —
+        anchoring equity to a rolling window resets the account to its starting
+        balance every Monday, which would hide a months-long drawdown from the
+        drawdown check entirely.
+        """
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(pnl), 0) AS s FROM trades WHERE pnl IS NOT NULL"
+        ).fetchone()
+        return float(row["s"])
+
     def realized_pnl_since(self, since: datetime) -> float:
         row = self._conn.execute(
             "SELECT COALESCE(SUM(pnl), 0) AS s FROM trades "
@@ -298,6 +311,50 @@ class TradeJournal:
             "avg_confidence_on_losses": by_outcome.get("loss", {}).get("avg_p"),
             "avg_realized_rr": by_outcome.get("win", {}).get("avg_rr"),
         }
+
+    def recent_trades(self, limit: int = 20) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM trades ORDER BY COALESCE(closed_at, opened_at) DESC "
+            "LIMIT ?", (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def recent_gate_decisions(self, limit: int = 20) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM gate_decisions ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["verdict"] = json.loads(d.get("verdict") or "{}")
+            except json.JSONDecodeError:
+                d["verdict"] = {}
+            out.append(d)
+        return out
+
+    def equity_curve(self, starting_equity: float) -> list[dict]:
+        """Cumulative realized PnL over closed trades, oldest first."""
+        rows = self._conn.execute(
+            "SELECT closed_at, pnl FROM trades WHERE closed_at IS NOT NULL "
+            "AND pnl IS NOT NULL ORDER BY closed_at"
+        ).fetchall()
+        equity = starting_equity
+        curve = [{"at": None, "equity": equity}]
+        for r in rows:
+            equity += float(r["pnl"])
+            curve.append({"at": r["closed_at"], "equity": equity})
+        return curve
+
+    def gate_failure_counts(self, limit: int = 200) -> dict[str, int]:
+        """Which gates reject most often — the signal for what to tune."""
+        counts: dict[str, int] = {}
+        for row in self.recent_gate_decisions(limit):
+            for c in row.get("verdict", {}).get("checks", []):
+                if not c.get("passed"):
+                    counts[c["name"]] = counts.get(c["name"], 0) + 1
+        return dict(sorted(counts.items(), key=lambda kv: -kv[1]))
 
     def save_daily_review(self, day: date, stats: dict, report: dict) -> None:
         self._conn.execute(

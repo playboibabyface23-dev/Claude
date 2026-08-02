@@ -84,6 +84,7 @@ per standard lot gives 1.39 lots — computed by `position_size()`, not by the m
 | Execution | `trading_system.execution` | Schema/risk/duplicate validator, then the TradersPost webhook client |
 | Monitoring | `trading_system.monitoring` | Position monitor + dynamic stop engine (breakeven, ATR trail, structure trail, auto-close) |
 | Memory | `trading_system.memory` | SQLite journal of every trade and gate decision, plus the daily learning review |
+| Dashboard | `trading_system.dashboard` | Control room: gate ledger, positions, analysis, agent reasoning, policy, journal |
 | Pine Script | `pine/structure_alerts.pine` | TradingView indicator firing BOS/CHOCH webhook alerts as an event source |
 
 ## Safety layer
@@ -195,6 +196,32 @@ protection.
 python -m trading_system.pipeline --symbol SPY --quote
 ```
 
+## Control room
+
+```bash
+python -m trading_system.dashboard --open     # http://127.0.0.1:8787
+python -m trading_system.dashboard --once     # static HTML snapshot
+python scripts/demo_dashboard.py              # render against synthetic data
+```
+
+The **gate ledger is the hero of the page, not a P&L number**. Every trading
+dashboard leads with equity; this system's actual identity is its refusals, so
+the most useful thing it can tell you is *why it didn't trade*. Each of the 16
+checks gets a severity stripe and its exact reason string, under a verdict
+banner naming the blockers.
+
+Around it: status tiles, open positions with their provenance (broker vs
+journal), the current structure and indicator read, the weighted confluence
+stack behind the probability, all six agent readouts, the equity curve, the
+active policy including which fail-safes are enforced, the trade journal, and a
+histogram of **most frequent rejections** — which is what tells you what to
+tune.
+
+Served by the standard library's HTTP server; the dashboard is not a reason to
+grow a web framework dependency. Generated HTML is gitignored — a fabricated
+equity curve sitting in a repo is the kind of thing that later gets mistaken
+for a real track record.
+
 ## Memory and daily learning
 
 Every trade stores chart reference, reason, entry, exit, win/loss, emotion,
@@ -230,7 +257,7 @@ Execution requires the explicit `--live` flag; anything else is analysis only.
 ## Tests
 
 ```bash
-python -m pytest tests/ -v      # 178 tests, no API keys or network required
+python -m pytest tests/ -v      # 195 tests, no API keys or network required
 ```
 
 Coverage is on the deterministic layers where correctness is checkable:

@@ -60,6 +60,9 @@ class RiskLimits:
     require_news_check: bool = True         # block when no news calendar is configured
     require_volatility_baseline: bool = True  # block when ATR baseline can't be computed
     news_blackout_minutes: float = 30.0     # skip trades this close to a high-impact event
+    # How many missed bars imply the feed has stopped. 3 tolerates a slow
+    # provider or a thin symbol; much more and a real halt goes unnoticed.
+    stale_bar_multiple: float = 3.0
 
     @classmethod
     def from_env(cls) -> "RiskLimits":
@@ -102,6 +105,11 @@ class Settings:
     alpaca_paper: bool = True   # trading host: paper-api vs api.alpaca.markets
     traderspost_webhook_url: str = ""
     journal_db_path: str = "trades.db"
+    # Optional user-maintained event calendar (JSON or CSV). Lets the news
+    # blackout work with no calendar API at all — see news.load_calendar_file.
+    news_calendar_file: str = ""
+    # Derive the rule-schedulable US releases (NFP, jobless claims) locally.
+    use_recurring_macro_events: bool = True
     risk: RiskLimits = field(default_factory=RiskLimits)
     # Force an asset class for symbols the classifier guesses wrong,
     # e.g. {"XAUUSD": "forex"}. Values match market_hours.AssetClass.
@@ -125,5 +133,9 @@ class Settings:
             alpaca_paper=_env_bool("ALPACA_PAPER", cls.alpaca_paper),
             traderspost_webhook_url=os.environ.get("TRADERSPOST_WEBHOOK_URL", ""),
             journal_db_path=os.environ.get("JOURNAL_DB_PATH", "trades.db"),
+            news_calendar_file=os.environ.get("NEWS_CALENDAR_FILE", ""),
+            use_recurring_macro_events=_env_bool(
+                "USE_RECURRING_MACRO_EVENTS", cls.use_recurring_macro_events
+            ),
             risk=RiskLimits.from_env(),
         )
