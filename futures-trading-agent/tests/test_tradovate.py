@@ -100,6 +100,14 @@ def test_requests_trigger_authentication_automatically():
     assert calls["auth"] == 1
 
 
+def test_get_access_token_authenticates_if_needed_and_returns_token():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=AUTH_OK)
+
+    token = run(client_with(handler).get_access_token())
+    assert token == "tok123"
+
+
 def test_expired_session_reauthenticates():
     calls = {"auth": 0}
 

@@ -40,23 +40,44 @@ Market data → Indicators → Claude decision engine → Risk manager → Execu
 | `backtesting/` | Replays history through the real risk manager and position management |
 | `powershell/` | `start_agent.ps1`, `restart_agent.ps1`, `watchdog.ps1`, `emergency_stop.ps1`, `update_agent.ps1` |
 
-## What is NOT bundled, on purpose
+## Live market data
 
-Tradovate's real-time and historical chart data is delivered over a
-WebSocket feed (`md/subscribeQuote`, `md/subscribeChart`). This session had
-no way to verify that wire format against Tradovate's live API, and getting
-it wrong silently would corrupt every indicator and every AI decision built
-on top of it — worse than an honest gap. `market/tradovate.py`'s auth,
-account, position, and order endpoints follow Tradovate's long-stable
-list/item/find/placeorder REST conventions and are covered by tests, but are
-similarly unverified against the live service; run `TradovateClient.check_connection()`
-against demo before trusting them with a real account.
+`market/tradovate_ws.py` implements Tradovate's real-time WebSocket feed —
+the piece originally left out because this session had no way to verify the
+wire format. It has since been fetched and confirmed directly from
+Tradovate's own tutorial repository (`tradovate/example-api-js`,
+`tutorial/WebSockets/EX-05` through `EX-10`), and the core of it was
+confirmed **live** against the real service during development:
 
-`market/data.py` defines the seam a live feed plugs into
-(`CandleAggregator.add_tick()`, `TickSource`, `HistoricalBarsProvider`) so
-one can be added without touching risk, execution, or the database. Until
-then, set `HISTORICAL_BARS_CSV_TEMPLATE` to poll a CSV each cycle for
-paper/demo runs.
+- Connecting to `wss://md.tradovateapi.com/v1/websocket` returns the
+  documented `'o'` open frame immediately.
+- Sending an `authorize` request (in the documented
+  `endpoint\nid\nquery\nbody` format) with a deliberately invalid token got
+  back a real `{"s": <non-200>, "i": 0, "d": "Access is denied"}` rejection —
+  i.e. the frame protocol, the request/response envelope, and the auth
+  round-trip are confirmed against production, not just documented.
+
+What is **not** yet re-verified live (no valid demo account was available in
+that session): the actual push-event shapes of `md/subscribequote` and
+`md/getchart` once authorized. `TradovateLiveFeed` combines historical
+warmup (`get_chart`) with live tick aggregation (`subscribe_quote` →
+`CandleAggregator`) to keep each traded symbol's candle history current —
+wire up real demo credentials and watch its output before trusting it with
+a funded account.
+
+When Tradovate credentials are configured, `main.py`'s `Agent` builds a
+`TradovateLiveFeed` automatically — no separate flag needed. Without them,
+set `HISTORICAL_BARS_CSV_TEMPLATE` to poll a CSV each cycle instead
+(paper/demo runs only, never a substitute for the live feed in production).
+`market/data.py`'s `TickSource`/`HistoricalBarsProvider` seam means any
+other live feed (a different vendor, a different protocol) can be wired in
+the same way without touching risk, execution, or the database.
+
+`market/tradovate.py`'s REST auth, account, position, and order endpoints
+follow Tradovate's long-stable list/item/find/placeorder conventions and are
+covered by tests, but were not separately re-verified live in this session;
+run `TradovateClient.check_connection()` against demo before trusting them
+with a real account.
 
 ## Setup
 
@@ -107,7 +128,7 @@ never counted as a win.
 ## Tests
 
 ```bash
-python -m pytest tests/ -v      # 204 tests, fully offline — no API keys or network required
+python -m pytest tests/ -v      # 233 tests, fully offline — no API keys or network required
 ```
 
 Every external integration (Tradovate, TradersPost, Claude) is exercised

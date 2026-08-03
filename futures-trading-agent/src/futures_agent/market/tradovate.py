@@ -138,6 +138,14 @@ class TradovateClient:
             await self.authenticate()
         return self._session
 
+    async def get_access_token(self) -> str:
+        """The current (auto-refreshed) access token, for handing to a
+        separate WebSocket connection (see tradovate_ws.py) — Tradovate's
+        real-time feed authenticates with the same REST-issued token rather
+        than a token of its own."""
+        session = await self._ensure_session()
+        return session.access_token
+
     # ------------------------------------------------------------ generic request
 
     async def _request(self, method: str, path: str, **kwargs: Any) -> Any:

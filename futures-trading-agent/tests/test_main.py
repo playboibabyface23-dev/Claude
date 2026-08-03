@@ -226,3 +226,82 @@ def test_account_state_reflects_database(tmp_path):
     assert state.open_positions == 1
     assert state.trades_today == 1
     agent.db.close()
+
+
+# --------------------------------------------------------------- live feed wiring
+
+class FakeLiveFeed:
+    def __init__(self, candles_by_symbol=None, raise_on_start=None) -> None:
+        self._candles = candles_by_symbol or {}
+        self._raise_on_start = raise_on_start
+        self.started: list[str] = []
+        self.closed = False
+
+    async def start(self, symbol: str) -> None:
+        if self._raise_on_start:
+            raise self._raise_on_start
+        self.started.append(symbol)
+
+    def candles(self, symbol: str):
+        return self._candles.get(symbol, [])
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def test_agent_builds_a_live_feed_automatically_when_tradovate_is_configured(tmp_path):
+    from futures_agent.config.settings import TradovateCredentials
+
+    settings = Settings(
+        anthropic_api_key="k", execution_mode="tradovate",
+        traded_symbols=("MNQ",), database_path=str(tmp_path / "agent.db"),
+        kill_switch_file=str(tmp_path / "KILL_SWITCH"), dashboard_port=0,
+        risk=RiskLimits(account_equity=50_000.0, risk_pct_per_trade=0.5),
+        tradovate=TradovateCredentials(environment="demo", username="u", password="p",
+                                      cid="1", sec="s"),
+    )
+    agent = Agent(settings, bars_provider=FakeBarsProvider(candles()),
+                 tradovate_client=FakeTradovate(), ai_client=FakeAIClient(HOLD_PAYLOAD))
+    assert agent.live_feed is not None
+    agent.db.close()
+
+
+def test_agent_has_no_live_feed_when_tradovate_is_not_configured(tmp_path):
+    agent, _ = make_agent(tmp_path, HOLD_PAYLOAD)
+    assert agent.live_feed is None
+    agent.db.close()
+
+
+def test_refresh_history_prefers_the_live_feed_over_the_csv_provider(tmp_path):
+    settings = make_settings(tmp_path)
+    live_candles = candles(30)
+    live_feed = FakeLiveFeed(candles_by_symbol={"MNQ": live_candles})
+    agent = Agent(settings, bars_provider=FakeBarsProvider(candles(5)),
+                 tradovate_client=FakeTradovate(), ai_client=FakeAIClient(HOLD_PAYLOAD),
+                 live_feed=live_feed)
+    run(agent.refresh_history("MNQ"))
+    assert live_feed.started == ["MNQ"]
+    assert len(agent.history["MNQ"]) == 30   # from the live feed, not the 5-bar CSV fixture
+    agent.db.close()
+
+
+def test_refresh_history_falls_back_to_csv_when_live_feed_fails(tmp_path):
+    settings = make_settings(tmp_path)
+    live_feed = FakeLiveFeed(raise_on_start=RuntimeError("socket unavailable"))
+    fallback_candles = candles(30)
+    agent = Agent(settings, bars_provider=FakeBarsProvider(fallback_candles),
+                 tradovate_client=FakeTradovate(), ai_client=FakeAIClient(HOLD_PAYLOAD),
+                 live_feed=live_feed)
+    run(agent.refresh_history("MNQ"))   # must not raise
+    assert len(agent.history["MNQ"]) == 30   # fell back to the CSV provider
+    agent.db.close()
+
+
+def test_close_closes_the_live_feed(tmp_path):
+    settings = make_settings(tmp_path)
+    live_feed = FakeLiveFeed()
+    agent = Agent(settings, bars_provider=FakeBarsProvider(candles()),
+                 tradovate_client=FakeTradovate(), ai_client=FakeAIClient(HOLD_PAYLOAD),
+                 live_feed=live_feed)
+    run(agent.close())
+    assert live_feed.closed

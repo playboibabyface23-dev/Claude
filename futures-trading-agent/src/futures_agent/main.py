@@ -7,12 +7,13 @@ Per traded symbol, per cycle:
 Runs until interrupted (Ctrl+C / SIGTERM) or the kill switch trips, then
 shuts down cleanly: closes the broker connection and stops the dashboard.
 
-Market data caveat: no live tick/bar feed is bundled (see the verification
-note atop market/tradovate.py — Tradovate's real-time chart data is
-WebSocket-based and this session had no way to confirm that wire format
-live). Set HISTORICAL_BARS_CSV_TEMPLATE to poll a CSV each cycle for
-paper/demo runs; production trading needs a real live feed wired into
-market/data.py's TickSource/HistoricalBarsProvider seam first.
+Market data: when Tradovate credentials are configured, `TradovateLiveFeed`
+(market/tradovate_ws.py) provides real live data — historical warmup via
+`md/getchart` plus ongoing bars aggregated from live trade ticks. See that
+module's docstring for exactly what has and hasn't been verified against
+Tradovate's live service. Without Tradovate credentials, set
+`HISTORICAL_BARS_CSV_TEMPLATE` to poll a CSV each cycle instead (paper/demo
+runs only — never a substitute for the live feed in production).
 """
 
 from __future__ import annotations
@@ -42,6 +43,7 @@ from .market.data import CsvBarsProvider, HistoricalBarsProvider, SessionTracker
 from .market.indicators import compute_snapshot
 from .market.models import Candle, Timeframe
 from .market.tradovate import TradovateClient
+from .market.tradovate_ws import TradovateLiveFeed
 from .risk.manager import AccountState, RiskManager
 
 log = logging.getLogger("futures_agent.main")
@@ -56,15 +58,17 @@ def build_bars_provider(settings: Settings) -> Optional[HistoricalBarsProvider]:
 
 
 class Agent:
-    """`bars_provider`, `tradovate_client`, `traderspost_client`, and
-    `ai_client` are all injectable — production wiring builds real ones from
-    `settings`, and tests inject fakes so the full cycle can run offline."""
+    """`bars_provider`, `tradovate_client`, `traderspost_client`, `ai_client`,
+    and `live_feed` are all injectable — production wiring builds real ones
+    from `settings`, and tests inject fakes so the full cycle can run
+    offline."""
 
     def __init__(self, settings: Settings,
                 bars_provider: Optional[HistoricalBarsProvider] = None,
                 tradovate_client: Optional[TradovateClient] = None,
                 traderspost_client: Optional[TradersPostClient] = None,
-                ai_client: Optional[object] = None) -> None:
+                ai_client: Optional[object] = None,
+                live_feed: Optional[TradovateLiveFeed] = None) -> None:
         self.settings = settings
         self.db = Database(settings.database_path)
         self.risk_manager = RiskManager(settings.risk, kill_switch_file=settings.kill_switch_file)
@@ -78,6 +82,16 @@ class Agent:
         else:
             self.traderspost = traderspost_client if traderspost_client is not None \
                 else TradersPostClient(settings.traderspost_webhook_url)
+
+        # Live market data needs its own Tradovate REST session regardless
+        # of execution_mode -- you can execute via TradersPost while still
+        # wanting Tradovate's real data, so this doesn't just reuse
+        # self.tradovate unless execution already built one.
+        self.live_feed: Optional[TradovateLiveFeed] = live_feed
+        if self.live_feed is None and settings.tradovate.configured:
+            market_data_client = self.tradovate or TradovateClient(settings.tradovate)
+            self.live_feed = TradovateLiveFeed(
+                market_data_client, Timeframe.from_minutes(settings.timeframe_minutes))
 
         self.execution = ExecutionEngine(
             settings.execution_mode,
@@ -99,6 +113,8 @@ class Agent:
         self._dashboard_server = None
 
     async def close(self) -> None:
+        if self.live_feed is not None:
+            await self.live_feed.close()
         if self.tradovate is not None:
             await self.tradovate.close()
         if self.traderspost is not None:
@@ -111,6 +127,20 @@ class Agent:
         self._running = False
 
     async def refresh_history(self, symbol: str) -> None:
+        if self.live_feed is not None:
+            try:
+                await self.live_feed.start(symbol)   # no-op if already started
+            except Exception as exc:
+                log.warning("%s: live feed unavailable this cycle: %s", symbol, exc)
+            else:
+                candles = self.live_feed.candles(symbol)
+                if candles:
+                    self.history[symbol] = candles
+                    tracker = self.sessions[symbol]
+                    for c in candles:
+                        tracker.update(c)
+                    return
+
         if self.bars_provider is None:
             return
         try:
