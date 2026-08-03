@@ -272,7 +272,10 @@ const fmt = (n, d = 2) => n == null ? "—" : Number(n).toFixed(d);
 const acct = S.account || {};
 el("stamp").textContent = S.generated_at ? new Date(S.generated_at).toLocaleString() : "—";
 const bClass = acct.breaker_ok ? "p-pass" : acct.breaker === "cooldown" ? "p-warn" : "p-fail";
-el("breaker-pill").innerHTML = `<span class="pill ${bClass}">${esc((acct.breaker || "unknown").replace(/_/g, " "))}</span>`;
+const bReactivates = acct.breaker_reactivates_at
+  ? ` — clears ${new Date(acct.breaker_reactivates_at).toLocaleString()}` : "";
+const bTitle = esc((acct.breaker_reason || "") + bReactivates);
+el("breaker-pill").innerHTML = `<span class="pill ${bClass}" title="${bTitle}">${esc((acct.breaker || "unknown").replace(/_/g, " "))}</span>`;
 const pos = S.positions || {};
 el("source-pill").innerHTML = pos.degraded
   ? `<span class="pill p-warn">positions: journal only</span>`

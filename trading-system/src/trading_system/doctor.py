@@ -195,6 +195,41 @@ async def check_broker_positions(settings: Settings, journal: TradeJournal) -> l
     return checks
 
 
+async def check_circuit_breaker(settings: Settings, journal: TradeJournal) -> list[DoctorCheck]:
+    """Whether the drawdown/losing-streak circuit breaker is already tripped.
+
+    A tripped breaker is not a misconfiguration — it is the safety layer doing
+    its job — but it means every trade will be refused right out of the gate,
+    which is worth knowing before going live rather than discovering it as a
+    silent rejection on the first run.
+    """
+    from .account import build_account_state
+    from .pipeline import build_position_provider
+    from .safety import BreakerState, SafetyLayer
+
+    provider = build_position_provider(settings, journal)
+    try:
+        account_state, _ = await build_account_state(journal, provider, settings)
+    except Exception as exc:
+        return [_check("circuit_breaker", "fail", str(exc),
+                       "could not assemble account state from the journal/broker")]
+    finally:
+        await provider.close()
+
+    detail = SafetyLayer(settings).breaker_detail(account_state)
+    if detail.state == BreakerState.TRADING_ALLOWED:
+        return [_check(
+            "circuit_breaker", "pass",
+            f"trading_allowed — equity={account_state.equity:.2f} "
+            f"daily={account_state.daily_pnl:.2f} weekly={account_state.weekly_pnl:.2f}",
+        )]
+    remedy = "the safety layer will refuse every trade until this clears"
+    if detail.reactivates_at:
+        remedy += f" (clears {detail.reactivates_at.isoformat()})"
+    return [_check("circuit_breaker", "warn",
+                   f"{detail.state.value}: {detail.reason}", remedy)]
+
+
 async def check_market_hours(settings: Settings, symbol: str) -> list[DoctorCheck]:
     calendar = build_market_hours(settings, symbol)
     try:
@@ -350,6 +385,7 @@ async def run_all(settings: Settings, symbol: str, timeframe: Timeframe,
     journal = TradeJournal(settings.journal_db_path)
     try:
         checks += await check_broker_positions(settings, journal)
+        checks += await check_circuit_breaker(settings, journal)
         checks += await check_journal(settings, journal)
     finally:
         journal.close()

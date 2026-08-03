@@ -126,7 +126,8 @@ async def build_snapshot(
         weekly_pnl=weekly_pnl, consecutive_losses=streak, last_loss_at=last_loss,
         positions_degraded=degraded,
     )
-    breaker = SafetyLayer(settings).breaker_state(account_state, now)
+    breaker_detail = SafetyLayer(settings).breaker_detail(account_state, now)
+    breaker = breaker_detail.state
 
     gate_rows = journal.recent_gate_decisions(limit=10)
     latest_verdict = gate_rows[0]["verdict"] if gate_rows else {}
@@ -145,6 +146,9 @@ async def build_snapshot(
             "consecutive_losses": streak,
             "breaker": breaker.value,
             "breaker_ok": breaker == BreakerState.TRADING_ALLOWED,
+            "breaker_reason": breaker_detail.reason,
+            "breaker_reactivates_at": breaker_detail.reactivates_at.isoformat()
+                                      if breaker_detail.reactivates_at else None,
         },
         "positions": {
             "items": open_positions,

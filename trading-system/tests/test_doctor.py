@@ -224,6 +224,32 @@ def test_broker_positions_fail_when_broker_unreachable(journal, monkeypatch):
     assert by_name["broker_positions"].status == "fail"
 
 
+# --------------------------------------------------------------- circuit breaker
+
+def test_circuit_breaker_passes_with_a_clean_account(journal):
+    checks = run(doctor.check_circuit_breaker(Settings(), journal))
+    assert checks[0].status == "pass"
+    assert "trading_allowed" in checks[0].detail
+
+
+def test_circuit_breaker_warns_when_daily_loss_halts_trading(journal):
+    from datetime import timezone
+
+    from trading_system.decision import TradeAction, TradeDecision
+    from trading_system.memory import TradeRecord
+
+    settings = Settings(risk=RiskLimits(account_equity=10_000.0, max_daily_loss_pct=1.0))
+    d = TradeDecision(symbol="SPY", action=TradeAction.BUY, entry=100.0, stop=99.0,
+                      target=103.0, risk_pct=1.0, quantity=100.0, probability=0.7)
+    tid = journal.record_trade(TradeRecord.from_decision(d))
+    journal.close_trade(tid, exit_price=98.0, pnl=-200.0, outcome="loss")
+
+    checks = run(doctor.check_circuit_breaker(settings, journal))
+    assert checks[0].status == "warn"
+    assert "halted" in checks[0].detail
+    assert "clears" in checks[0].remedy
+
+
 # --------------------------------------------------------------- market hours
 
 def test_market_hours_offline_calendar_warns_for_us_equity():

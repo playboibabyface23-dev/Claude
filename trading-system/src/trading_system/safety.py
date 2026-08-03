@@ -20,7 +20,7 @@ and pre-trade-discipline-gate patterns from claude-trading-skills.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Optional
 
@@ -106,6 +106,29 @@ COOLDOWN_HOURS = 24.0
 MIN_RELATIVE_VOLUME = 0.3   # dead-liquidity floor
 
 
+@dataclass(frozen=True)
+class BreakerDetail:
+    """Why the breaker is where it is, and when it lifts on its own.
+
+    Daily/weekly halts clear at the next calendar boundary because
+    ``daily_pnl``/``weekly_pnl`` are always recomputed from the journal since
+    midnight/Monday — there is nothing to reset by hand. A drawdown halt has
+    no such boundary: it only lifts once equity recovers, so
+    ``reactivates_at`` is left ``None``.
+    """
+
+    state: BreakerState
+    reason: str = ""
+    reactivates_at: Optional[datetime] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "state": self.state.value,
+            "reason": self.reason,
+            "reactivates_at": self.reactivates_at.isoformat() if self.reactivates_at else None,
+        }
+
+
 class SafetyLayer:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -113,23 +136,54 @@ class SafetyLayer:
 
     # ------------------------------------------------------------ circuit breaker
 
-    def breaker_state(self, account: AccountState,
-                      now: Optional[datetime] = None) -> BreakerState:
+    def breaker_detail(self, account: AccountState,
+                       now: Optional[datetime] = None) -> BreakerDetail:
         now = now or datetime.now(timezone.utc)
         eq = self.limits.account_equity
+
         if account.daily_pnl <= -eq * self.limits.max_daily_loss_pct / 100:
-            return BreakerState.HALTED
+            next_day = (now + timedelta(days=1)).replace(
+                hour=0, minute=0, second=0, microsecond=0)
+            return BreakerDetail(
+                BreakerState.HALTED,
+                f"daily loss {account.daily_pnl:.2f} breached the "
+                f"{self.limits.max_daily_loss_pct:g}% daily cap",
+                next_day,
+            )
         if account.weekly_pnl <= -eq * self.limits.max_weekly_loss_pct / 100:
-            return BreakerState.HALTED
+            days_ahead = (7 - now.weekday()) or 7   # next Monday 00:00 UTC
+            next_week = (now + timedelta(days=days_ahead)).replace(
+                hour=0, minute=0, second=0, microsecond=0)
+            return BreakerDetail(
+                BreakerState.HALTED,
+                f"weekly loss {account.weekly_pnl:.2f} breached the "
+                f"{self.limits.max_weekly_loss_pct:g}% weekly cap",
+                next_week,
+            )
         if account.high_water_mark > 0:
             dd_pct = (account.high_water_mark - account.equity) / account.high_water_mark * 100
             if dd_pct >= self.limits.max_drawdown_pct:
-                return BreakerState.HALTED
+                return BreakerDetail(
+                    BreakerState.HALTED,
+                    f"drawdown {dd_pct:.2f}% from the equity high-water mark "
+                    f"breached the {self.limits.max_drawdown_pct:g}% cap — "
+                    "clears only once equity recovers",
+                )
         if account.consecutive_losses >= LOSING_STREAK_LIMIT and account.last_loss_at:
             hours = (now - account.last_loss_at).total_seconds() / 3600
             if hours < COOLDOWN_HOURS:
-                return BreakerState.COOLDOWN
-        return BreakerState.TRADING_ALLOWED
+                reactivates = account.last_loss_at + timedelta(hours=COOLDOWN_HOURS)
+                return BreakerDetail(
+                    BreakerState.COOLDOWN,
+                    f"{account.consecutive_losses} consecutive losses — "
+                    f"cooldown until {reactivates.isoformat()}",
+                    reactivates,
+                )
+        return BreakerDetail(BreakerState.TRADING_ALLOWED)
+
+    def breaker_state(self, account: AccountState,
+                      now: Optional[datetime] = None) -> BreakerState:
+        return self.breaker_detail(account, now).state
 
     # ------------------------------------------------------------ full checklist
 

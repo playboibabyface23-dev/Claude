@@ -93,6 +93,68 @@ def test_losing_streak_triggers_cooldown_then_releases():
     assert layer.breaker_state(acct, now) == BreakerState.TRADING_ALLOWED
 
 
+# --------------------------------------------------------------- breaker detail
+
+def test_breaker_detail_trading_allowed_has_no_reactivation_time():
+    detail = SafetyLayer(settings()).breaker_detail(healthy_account())
+    assert detail.state == BreakerState.TRADING_ALLOWED
+    assert detail.reactivates_at is None
+
+
+def test_breaker_detail_daily_halt_reactivates_at_next_midnight_utc():
+    now = datetime(2026, 8, 3, 15, 0, tzinfo=timezone.utc)
+    acct = healthy_account()
+    acct.daily_pnl = -EQUITY * 0.031
+    detail = SafetyLayer(settings()).breaker_detail(acct, now)
+    assert detail.state == BreakerState.HALTED
+    assert "daily loss" in detail.reason
+    assert detail.reactivates_at == datetime(2026, 8, 4, 0, 0, tzinfo=timezone.utc)
+
+
+def test_breaker_detail_weekly_halt_reactivates_next_monday():
+    # 2026-08-03 is a Monday; a breach then should clear the following Monday.
+    now = datetime(2026, 8, 3, 12, 0, tzinfo=timezone.utc)
+    acct = healthy_account()
+    acct.weekly_pnl = -EQUITY * 0.061
+    detail = SafetyLayer(settings()).breaker_detail(acct, now)
+    assert detail.state == BreakerState.HALTED
+    assert "weekly loss" in detail.reason
+    assert detail.reactivates_at == datetime(2026, 8, 10, 0, 0, tzinfo=timezone.utc)
+    assert detail.reactivates_at.weekday() == 0
+
+
+def test_breaker_detail_drawdown_halt_has_no_reactivation_time():
+    """A drawdown breach has no calendar boundary — it only clears once equity
+    itself recovers, so there is nothing to schedule."""
+    acct = AccountState(equity=EQUITY * 0.89, high_water_mark=EQUITY)
+    detail = SafetyLayer(settings()).breaker_detail(acct)
+    assert detail.state == BreakerState.HALTED
+    assert "drawdown" in detail.reason
+    assert detail.reactivates_at is None
+
+
+def test_breaker_detail_cooldown_reactivates_exactly_at_the_cooldown_boundary():
+    now = datetime.now(timezone.utc)
+    acct = healthy_account()
+    acct.consecutive_losses = 2
+    acct.last_loss_at = now - timedelta(hours=2)
+    detail = SafetyLayer(settings()).breaker_detail(acct, now)
+    assert detail.state == BreakerState.COOLDOWN
+    assert detail.reactivates_at == acct.last_loss_at + timedelta(hours=24)
+
+
+def test_breaker_state_and_breaker_detail_never_disagree():
+    """breaker_state is a thin wrapper — it must not drift from breaker_detail."""
+    now = datetime.now(timezone.utc)
+    layer = SafetyLayer(settings())
+    for acct in (
+        healthy_account(),
+        AccountState(equity=EQUITY, high_water_mark=EQUITY, daily_pnl=-EQUITY * 0.05),
+        AccountState(equity=EQUITY * 0.85, high_water_mark=EQUITY),
+    ):
+        assert layer.breaker_state(acct, now) == layer.breaker_detail(acct, now).state
+
+
 def test_news_blackout_blocks_entry():
     market = calm_market(high_impact_news_within_minutes=5.0)
     verdict = SafetyLayer(settings()).evaluate(good_decision(), healthy_account(), market)

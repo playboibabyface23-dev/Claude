@@ -101,6 +101,28 @@ rejects the trade:
 
 On top of that a circuit breaker returns `TRADING_ALLOWED`, `COOLDOWN`
 (losing-streak cooldown), or `HALTED` (daily / weekly / max-drawdown breach).
+Every trip carries a reason and, where one exists, the moment it clears on its
+own: a daily halt clears at the next UTC midnight, a weekly halt at the next
+Monday, a losing-streak cooldown 24h after the last loss — because
+`daily_pnl`/`weekly_pnl` are always recomputed from the journal since that
+boundary, there is nothing to reset by hand. A drawdown halt has no such
+boundary; it clears only once equity itself recovers. `python -m
+trading_system.doctor` and the dashboard both surface the live reason and
+clear-by time, not just the state name.
+
+This circuit breaker and the position-size/risk-reward/probability checks
+above are a native, code-first implementation of the same ideas as the
+`drawdown-circuit-breaker` and `pre-trade-discipline-gate` skills from the
+uploaded claude-trading-skills toolkit: account-level halts on
+daily/weekly/drawdown breach, a losing-streak cooldown,
+and a checklist that a trade has a plan, a predefined stop, and size matching
+that plan. Those skills are built for a *discretionary* trader journaling
+entries by hand into YAML thesis files and answering a checklist after the
+fact; this system's `TradeDecision` always carries an entry, stop, and
+code-computed size, so the equivalent checks run automatically, every time,
+against the same account state the rest of the safety layer already uses —
+rather than shelling out to a file-based tool built around a workflow this
+system doesn't have.
 
 ### Unknown blocks the trade
 
@@ -268,9 +290,13 @@ python -m trading_system.doctor --symbol SPY --json report.json
 ```
 
 Runs the same code paths the live pipeline uses — credentials, market data,
-quotes, broker positions, market hours, news, the journal, risk policy, and
-TradersPost configuration — and reports pass/warn/fail per integration with a
-named remedy for anything broken. Exits non-zero if anything failed.
+quotes, broker positions, the circuit breaker, market hours, news, the
+journal, risk policy, and TradersPost configuration — and reports pass/warn/
+fail per integration with a named remedy for anything broken. Exits non-zero
+if anything failed. The circuit-breaker check surfaces a tripped breaker as a
+warning rather than a failure — it isn't a misconfiguration, but it does mean
+every trade will be refused until it clears, which is worth knowing before the
+first live run rather than discovering it as a silent rejection.
 
 **Side-effect free by design.** It never places an order — not even a "ping"
 to TradersPost, since whether that fires a real fill depends on a paper/live
@@ -318,7 +344,7 @@ Execution requires the explicit `--live` flag; anything else is analysis only.
 ## Tests
 
 ```bash
-python -m pytest tests/ -v      # 244 tests, no API keys or network required
+python -m pytest tests/ -v      # 252 tests, no API keys or network required
 ```
 
 Coverage is on the deterministic layers where correctness is checkable:
