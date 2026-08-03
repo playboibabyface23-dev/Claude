@@ -1,0 +1,18 @@
+.env
+*.db
+*.sqlite3
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# Runtime logs, PID file, and the kill-switch sentinel file.
+logs/*.log
+logs/*.jsonl
+logs/*.pid
+logs/KILL_SWITCH
+!logs/.gitkeep
