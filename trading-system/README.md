@@ -86,6 +86,7 @@ per standard lot gives 1.39 lots — computed by `position_size()`, not by the m
 | Memory | `trading_system.memory` | SQLite journal of every trade and gate decision, plus the daily learning review |
 | Backtest | `trading_system.backtest` | Replays history through the real structure, safety, and stop engines with look-ahead and cost controls |
 | Dashboard | `trading_system.dashboard` | Control room: gate ledger, positions, analysis, agent reasoning, policy, journal |
+| Preflight | `trading_system.doctor` | Side-effect-free check of every configured integration before trading live |
 | Pine Script | `pine/structure_alerts.pine` | TradingView indicator firing BOS/CHOCH webhook alerts as an event source |
 
 ## Safety layer
@@ -258,6 +259,30 @@ grow a web framework dependency. Generated HTML is gitignored — a fabricated
 equity curve sitting in a repo is the kind of thing that later gets mistaken
 for a real track record.
 
+## Preflight
+
+```bash
+python -m trading_system.doctor --symbol SPY
+python -m trading_system.doctor --symbol SPY --check-claude   # also verifies Claude auth (uses tokens)
+python -m trading_system.doctor --symbol SPY --json report.json
+```
+
+Runs the same code paths the live pipeline uses — credentials, market data,
+quotes, broker positions, market hours, news, the journal, risk policy, and
+TradersPost configuration — and reports pass/warn/fail per integration with a
+named remedy for anything broken. Exits non-zero if anything failed.
+
+**Side-effect free by design.** It never places an order — not even a "ping"
+to TradersPost, since whether that fires a real fill depends on a paper/live
+toggle this system cannot read back (TradersPost exposes no position or
+account API). TradersPost is checked for webhook URL shape only; connectivity
+is left to manual verification in the TradersPost dashboard. The Claude check
+is opt-in via `--check-claude` because it spends a small number of tokens.
+
+The verdict is one of `NOT READY` (something failed), `READY WITH CAVEATS`
+(everything resolved but at least one check is running in a degraded mode —
+e.g. the offline market-hours calendar instead of a live clock), or `READY`.
+
 ## Memory and daily learning
 
 Every trade stores chart reference, reason, entry, exit, win/loss, emotion,
@@ -293,7 +318,7 @@ Execution requires the explicit `--live` flag; anything else is analysis only.
 ## Tests
 
 ```bash
-python -m pytest tests/ -v      # 213 tests, no API keys or network required
+python -m pytest tests/ -v      # 244 tests, no API keys or network required
 ```
 
 Coverage is on the deterministic layers where correctness is checkable:
