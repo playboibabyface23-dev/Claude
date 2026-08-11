@@ -143,6 +143,95 @@ def test_scanning_resumes_after_the_exit_bar_not_immediately(monkeypatch):
     assert result.trades[1].entry_index == 4
 
 
+# --------------------------------------------------------------- cost modeling
+
+def test_slippage_moves_entry_price_against_a_buy(monkeypatch):
+    candles = [flat_bar(0), flat_bar(1, o=100.0), flat_bar(2), flat_bar(3)]
+    patch_strategy(monkeypatch, signal_at(1))
+    result = Backtester(cfg(slippage_ticks=4)).run(candles)
+    t = result.trades[0]
+    # MNQ tick_size=0.25 -> 4 ticks = 1.0 point, worse (higher) for a long entry.
+    assert t.entry == pytest.approx(101.0)
+
+
+def test_slippage_moves_stop_exit_further_against_you(monkeypatch):
+    small_stop = AIDecision(symbol="MNQ", action=AIAction.BUY, confidence=90.0,
+                            entry_reason="t", stop_loss=5.0, take_profit=50.0)
+    candles = [flat_bar(0), flat_bar(1),
+              flat_bar(2, o=100.0, h=101.0, l=90.0, c=95.0)]
+    patch_strategy(monkeypatch, signal_at(1, decision=small_stop))
+    result = Backtester(cfg(slippage_ticks=4)).run(candles)
+    t = result.trades[0]
+    assert t.entry == pytest.approx(101.0)          # 100 + 1.0
+    assert t.stop == pytest.approx(96.0)             # 101 - 5
+    assert t.exit_price == pytest.approx(95.0)       # 96 - 1.0, worse than the stop level
+    assert t.exit_reason == "stop_hit"
+
+
+def test_slippage_does_not_affect_target_fill_price(monkeypatch):
+    small_target = AIDecision(symbol="MNQ", action=AIAction.BUY, confidence=90.0,
+                              entry_reason="t", stop_loss=5.0, take_profit=4.0)
+    candles = [flat_bar(0), flat_bar(1),
+              flat_bar(2, o=100.0, h=105.0, l=99.0, c=104.0)]
+    patch_strategy(monkeypatch, signal_at(1, decision=small_target))
+    result = Backtester(cfg(slippage_ticks=4)).run(candles)
+    t = result.trades[0]
+    assert t.exit_reason == "target_hit"
+    assert t.exit_price == pytest.approx(105.0)      # 101 + 4, no slippage on a limit fill
+
+
+def test_commission_reduces_pnl_and_is_recorded_on_the_trade(monkeypatch):
+    small_target = AIDecision(symbol="MNQ", action=AIAction.BUY, confidence=90.0,
+                              entry_reason="t", stop_loss=5.0, take_profit=4.0)
+    candles = [flat_bar(0), flat_bar(1),
+              flat_bar(2, o=100.0, h=105.0, l=99.0, c=104.0)]
+    patch_strategy(monkeypatch, signal_at(1, decision=small_target))
+    free = Backtester(cfg()).run(candles).trades[0]
+    costly = Backtester(cfg(commission_per_contract=5.0)).run(candles).trades[0]
+    assert costly.commission == pytest.approx(5.0 * costly.contracts)
+    assert costly.pnl == pytest.approx(free.pnl - costly.commission)
+
+
+def test_metrics_report_costs_separately_from_net_pnl(monkeypatch):
+    small_target = AIDecision(symbol="MNQ", action=AIAction.BUY, confidence=90.0,
+                              entry_reason="t", stop_loss=5.0, take_profit=4.0)
+    candles = [flat_bar(0), flat_bar(1),
+              flat_bar(2, o=100.0, h=105.0, l=99.0, c=104.0)]
+    patch_strategy(monkeypatch, signal_at(1, decision=small_target))
+    result = Backtester(cfg(commission_per_contract=5.0, slippage_ticks=4)).run(candles)
+    m = result.metrics()
+    assert m["total_commission"] > 0
+    assert m["total_slippage_cost"] > 0
+    assert m["gross_pnl_before_costs"] == pytest.approx(
+        m["net_pnl"] + m["total_commission"] + m["total_slippage_cost"])
+
+
+def test_zero_cost_config_stays_frictionless(monkeypatch):
+    candles = [flat_bar(0), flat_bar(1), flat_bar(2, l=90.0), flat_bar(3)]
+    patch_strategy(monkeypatch, signal_at(1))
+    result = Backtester(cfg()).run(candles)
+    m = result.metrics()
+    assert m["total_commission"] == 0.0
+    assert m["total_slippage_cost"] == 0.0
+    assert m["gross_pnl_before_costs"] == pytest.approx(m["net_pnl"])
+
+
+def test_report_notes_no_costs_modeled_by_default(monkeypatch):
+    candles = [flat_bar(0), flat_bar(1), flat_bar(2, l=90.0), flat_bar(3)]
+    patch_strategy(monkeypatch, signal_at(1))
+    result = Backtester(cfg()).run(candles)
+    assert "none modeled" in format_report(result)
+
+
+def test_report_shows_cost_breakdown_when_configured(monkeypatch):
+    candles = [flat_bar(0), flat_bar(1), flat_bar(2, l=90.0), flat_bar(3)]
+    patch_strategy(monkeypatch, signal_at(1))
+    result = Backtester(cfg(commission_per_contract=5.0)).run(candles)
+    text = format_report(result)
+    assert "Commission" in text
+    assert "Gross P&L before costs" in text
+
+
 # --------------------------------------------------------------- risk manager gating
 
 def test_low_confidence_signal_is_rejected_and_no_trade_taken(monkeypatch):

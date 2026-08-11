@@ -30,6 +30,11 @@ def main() -> int:
     p.add_argument("--max-drawdown-pct", type=float, default=8.0)
     p.add_argument("--min-confidence", type=float, default=65.0)
     p.add_argument("--warmup-bars", type=int, default=30)
+    p.add_argument("--commission-per-contract", type=float, default=0.0,
+                   help="round-trip commission per contract, charged once per closed trade")
+    p.add_argument("--slippage-ticks", type=float, default=0.0,
+                   help="ticks of adverse slippage on entries and stop exits (not targets); "
+                        "0 = frictionless, which overstates edge -- see backtesting/engine.py")
     p.add_argument("--json", help="also write the full result as JSON")
     args = p.parse_args()
 
@@ -46,7 +51,8 @@ def main() -> int:
         symbol=args.symbol, starting_equity=args.equity, risk_pct_per_trade=args.risk_pct,
         max_daily_loss_pct=args.max_daily_loss_pct, max_trades_per_day=args.max_trades_per_day,
         max_drawdown_pct=args.max_drawdown_pct, min_ai_confidence=args.min_confidence,
-        warmup_bars=args.warmup_bars,
+        warmup_bars=args.warmup_bars, commission_per_contract=args.commission_per_contract,
+        slippage_ticks=args.slippage_ticks,
     )
     result = Backtester(config).run(candles)
     print(format_report(result))

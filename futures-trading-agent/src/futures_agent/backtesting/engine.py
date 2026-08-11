@@ -13,6 +13,20 @@ Bias controls, the part that actually matters here:
     OHLC alone; the loss is assumed and the trade is flagged `ambiguous_exit`.
   - Positions still open when the data runs out are marked
     `still_open_at_end` and never counted as a win.
+
+Cost modeling: `commission_per_contract` (a round-trip total, charged once
+per closed trade — not per side) and `slippage_ticks` are both 0 unless set
+explicitly, so an unconfigured run is frictionless and will overstate
+edge. `slippage_ticks` is applied against you on the entry fill and on a
+stop-loss exit (both effectively market fills once triggered) but NOT on a
+target exit, which is modeled as a limit fill at exactly its price — the
+same "assume no better than stated, never assume in your favor" posture
+used for the ambiguous-exit rule above. There is no universal "correct"
+slippage figure — it depends on the contract's liquidity and the size
+being traded — so this is a configurable assumption to stress-test
+against, not a validated number. `BacktestResult.metrics()` reports total
+commission and slippage cost separately from net PnL so their impact on
+the numbers stays visible instead of getting silently absorbed into them.
 """
 
 from __future__ import annotations
@@ -41,7 +55,8 @@ class BacktestConfig:
     max_open_positions: int = 1
     min_ai_confidence: float = 65.0
     warmup_bars: int = 30
-    commission_per_contract: float = 0.0
+    commission_per_contract: float = 0.0   # round-trip total, per contract
+    slippage_ticks: float = 0.0            # applied to entries and stop exits only
 
 
 @dataclass
@@ -61,6 +76,8 @@ class BacktestTrade:
     r_multiple: float = 0.0
     exit_reason: str = "still_open_at_end"
     ambiguous_exit: bool = False
+    commission: float = 0.0
+    slippage_cost: float = 0.0
 
     def to_dict(self) -> dict:
         return {
@@ -71,6 +88,7 @@ class BacktestTrade:
             "exit_time": self.exit_time.isoformat() if self.exit_time else None,
             "exit_price": self.exit_price, "pnl": self.pnl, "r_multiple": self.r_multiple,
             "exit_reason": self.exit_reason, "ambiguous_exit": self.ambiguous_exit,
+            "commission": self.commission, "slippage_cost": self.slippage_cost,
         }
 
 
@@ -113,6 +131,8 @@ class BacktestResult:
                 max_dd = max(max_dd, (peak - v) / peak * 100)
 
         final_equity = self.equity_curve[-1] if self.equity_curve else self.config.starting_equity
+        total_commission = sum(t.commission for t in closed)
+        total_slippage_cost = sum(t.slippage_cost for t in closed)
 
         return {
             "trades": n,
@@ -123,6 +143,9 @@ class BacktestResult:
             "total_r": sum(t.r_multiple for t in closed) if closed else 0.0,
             "profit_factor": profit_factor,
             "net_pnl": sum(t.pnl for t in closed),
+            "gross_pnl_before_costs": sum(t.pnl for t in closed) + total_commission + total_slippage_cost,
+            "total_commission": total_commission,
+            "total_slippage_cost": total_slippage_cost,
             "max_drawdown_pct": max_dd,
             "return_pct": ((final_equity - self.config.starting_equity)
                           / self.config.starting_equity * 100),
@@ -215,8 +238,15 @@ class Backtester:
                 continue
 
             entry_index = i + 1
-            entry_price = candles[entry_index].open
             direction = 1 if decision.action == AIAction.BUY else -1
+            # Entries and stop exits are effectively market fills once
+            # triggered -- slippage moves the fill against you on both.
+            # Target exits are modeled as limit fills at exactly the target
+            # price (no slippage), the conservative "no better than stated"
+            # assumption. See the module docstring.
+            slippage_price = cfg.slippage_ticks * self.symbol_spec.tick_size
+            leg_slippage_cost = cfg.slippage_ticks * self.symbol_spec.tick_value * verdict.contracts
+            entry_price = candles[entry_index].open + direction * slippage_price
             stop = entry_price - direction * decision.stop_loss
             target = entry_price + direction * decision.take_profit
 
@@ -224,6 +254,7 @@ class Backtester:
                 entry_index=entry_index, entry_time=candles[entry_index].timestamp,
                 direction=decision.action.value, contracts=verdict.contracts,
                 entry=entry_price, stop=stop, target=target, confidence=decision.confidence,
+                slippage_cost=leg_slippage_cost,   # the entry leg; a stop exit adds a second leg below
             )
             trades_today += 1
 
@@ -235,11 +266,13 @@ class Backtester:
                 if hit_stop and hit_target:
                     trade.ambiguous_exit = True
                     trade.exit_index, trade.exit_time = j, bar.timestamp
-                    trade.exit_price, trade.exit_reason = stop, "stop_hit"
+                    trade.exit_price, trade.exit_reason = stop - direction * slippage_price, "stop_hit"
+                    trade.slippage_cost += leg_slippage_cost
                     break
                 if hit_stop:
                     trade.exit_index, trade.exit_time = j, bar.timestamp
-                    trade.exit_price, trade.exit_reason = stop, "stop_hit"
+                    trade.exit_price, trade.exit_reason = stop - direction * slippage_price, "stop_hit"
+                    trade.slippage_cost += leg_slippage_cost
                     break
                 if hit_target:
                     trade.exit_index, trade.exit_time = j, bar.timestamp
@@ -250,6 +283,10 @@ class Backtester:
             if trade.exit_price is not None:
                 price_diff = (trade.exit_price - trade.entry) * direction
                 commission = cfg.commission_per_contract * trade.contracts
+                trade.commission = commission
+                # Slippage is already reflected in trade.entry/exit_price above --
+                # trade.slippage_cost is informational (see metrics()), not
+                # subtracted again here, or the cost would be double-counted.
                 trade.pnl = price_diff * self.symbol_spec.multiplier * trade.contracts - commission
                 risk_dollars = abs(trade.entry - trade.stop) * self.symbol_spec.multiplier * trade.contracts
                 trade.r_multiple = (trade.pnl / risk_dollars) if risk_dollars > 0 else 0.0

@@ -57,6 +57,18 @@ def format_report(result: BacktestResult) -> str:
     for k, v in rows:
         lines.append(f"  {k:<20} {v}")
 
+    if cfg.commission_per_contract or cfg.slippage_ticks:
+        lines.append("")
+        lines.append(f"COSTS  (commission=${cfg.commission_per_contract:g}/contract, "
+                     f"slippage={cfg.slippage_ticks:g} ticks)")
+        lines.append(f"  Gross P&L before costs  ${m['gross_pnl_before_costs']:,.2f}")
+        lines.append(f"  Commission              ${m['total_commission']:,.2f}")
+        lines.append(f"  Slippage                ${m['total_slippage_cost']:,.2f}")
+    else:
+        lines.append("")
+        lines.append("COSTS  none modeled (--commission-per-contract / --slippage-ticks")
+        lines.append("       both 0) -- this run is frictionless and overstates edge.")
+
     lines.append("")
     lines.append("SIGNAL FUNNEL")
     lines.append(f"  {m['signals_generated']} signal(s) generated, "

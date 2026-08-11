@@ -134,10 +134,29 @@ open, a bar that spans both stop and target resolves as a loss
 (`ambiguous_exit`), and positions still open at the end of the data are
 never counted as a win.
 
+**Cost modeling is opt-in and 0 by default**, which makes an unconfigured
+run frictionless and overstate edge — the report says so explicitly when
+nothing is set:
+
+```bash
+python -m futures_agent.backtesting --symbol MNQ --csv bars.csv \
+  --commission-per-contract 4.50 --slippage-ticks 1
+```
+
+`--slippage-ticks` is applied against you on entries and stop-loss exits
+(both effectively market fills once triggered) but never on target exits,
+which are modeled as limit fills at exactly the target price. There's no
+universally "correct" slippage number — it depends on the contract's
+liquidity and your size — so treat this as a knob to stress-test results
+against, not a validated figure. `--commission-per-contract` is a
+round-trip total charged once per closed trade. The report and
+`metrics()` break commission and slippage out from net P&L separately so
+their impact stays visible instead of disappearing into one number.
+
 ## Tests
 
 ```bash
-python -m pytest tests/ -v      # 276 tests, fully offline — no API keys or network required
+python -m pytest tests/ -v      # 284 tests, fully offline — no API keys or network required
 ```
 
 Every external integration (Tradovate, TradersPost, Claude) is exercised
