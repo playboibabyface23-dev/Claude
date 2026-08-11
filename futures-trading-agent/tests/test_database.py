@@ -138,6 +138,20 @@ def test_update_high_water_mark_ratchets_up_only(db):
 
 # --------------------------------------------------------------- persistence
 
+def test_open_trades_returns_only_open_ones(db):
+    insert_trade(db, "t1", symbol="MNQ")
+    insert_trade(db, "t2", symbol="ES")
+    db.close_trade("t2", exit_price=1.0, pnl=1.0)
+    open_trades = db.open_trades()
+    assert [t["identifier"] for t in open_trades] == ["t1"]
+
+
+def test_open_trades_filters_by_symbol(db):
+    insert_trade(db, "t1", symbol="MNQ")
+    insert_trade(db, "t2", symbol="ES")
+    assert [t["identifier"] for t in db.open_trades(symbol="es")] == ["t2"]
+
+
 # --------------------------------------------------------------- daily equity
 
 def test_record_daily_equity_upserts_same_day(db):

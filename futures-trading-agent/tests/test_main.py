@@ -80,6 +80,7 @@ class FakeTradovate:
         self.calls: list[dict] = []
         self._raise_on_place = raise_on_place
         self.closed = False
+        self.positions: list[dict] = []
 
     async def find_contract(self, symbol):
         return {"id": 1, "name": symbol}
@@ -94,7 +95,7 @@ class FakeTradovate:
         return {"orderId": 555}
 
     async def list_positions(self, account_id):
-        return []
+        return self.positions
 
     async def close(self):
         self.closed = True
@@ -331,6 +332,123 @@ def test_notifier_closed_on_agent_close(tmp_path):
     agent.notifier = notifier
     run(agent.close())
     assert notifier.closed
+
+
+# --------------------------------------------------------------- position reconciliation
+
+def test_reconcile_closes_trade_when_broker_shows_flat(tmp_path):
+    tv = FakeTradovate()
+    tv.positions = []   # broker shows nothing open
+    agent, _ = make_agent(tmp_path, HOLD_PAYLOAD, tradovate=tv)
+    agent.db.record_trade(identifier="t1", symbol="MNQ", action="BUY", contracts=2,
+                          entry_price=100.0)
+    agent.history["MNQ"] = [Candle(timestamp=datetime.now(UTC), open=105.0, high=106.0,
+                                   low=104.0, close=105.0, volume=10)]
+
+    run(agent.reconcile_positions())
+
+    assert agent.db.open_positions_count() == 0
+    trades = agent.db.recent_trades(limit=1)
+    assert trades[0]["status"] == "closed"
+    assert trades[0]["exit_price"] == pytest.approx(105.0)
+    assert trades[0]["pnl"] == pytest.approx((105.0 - 100.0) * 2 * 2.0)   # MNQ multiplier=2.0
+    rejections = agent.db.recent_rejections()
+    assert rejections[0]["reason"] == "position_reconciled"
+    agent.db.close()
+
+
+def test_reconcile_leaves_trade_open_when_broker_still_shows_it(tmp_path):
+    tv = FakeTradovate()
+    tv.positions = [{"contractId": 1, "netPos": 2}]   # broker still holds it
+    agent, _ = make_agent(tmp_path, HOLD_PAYLOAD, tradovate=tv)
+    agent.db.record_trade(identifier="t1", symbol="MNQ", action="BUY", contracts=2,
+                          entry_price=100.0)
+
+    run(agent.reconcile_positions())
+
+    assert agent.db.open_positions_count() == 1
+    agent.db.close()
+
+
+def test_reconcile_is_a_noop_with_no_open_trades(tmp_path):
+    tv = FakeTradovate()
+    agent, _ = make_agent(tmp_path, HOLD_PAYLOAD, tradovate=tv)
+    run(agent.reconcile_positions())   # must not raise, no positions/get_account calls needed
+    agent.db.close()
+
+
+def test_reconcile_is_a_noop_without_a_position_client(tmp_path):
+    # traderspost execution + Tradovate not configured + nothing injected ->
+    # no way to know broker state, so reconciliation has nothing to check.
+    settings = Settings(
+        anthropic_api_key="k", execution_mode="traderspost",
+        traderspost_webhook_url="https://hooks.example/x",
+        traded_symbols=("MNQ",), database_path=str(tmp_path / "agent.db"),
+        kill_switch_file=str(tmp_path / "KILL_SWITCH"), dashboard_port=0,
+        risk=RiskLimits(account_equity=50_000.0, risk_pct_per_trade=0.5),
+    )
+    agent = Agent(settings, bars_provider=FakeBarsProvider(candles()),
+                 ai_client=FakeAIClient(HOLD_PAYLOAD))
+    assert agent.position_client is None
+    run(agent.reconcile_positions())
+    run(agent.close())
+
+
+def test_reconcile_falls_back_to_entry_price_without_market_data(tmp_path):
+    tv = FakeTradovate()
+    tv.positions = []
+    agent, _ = make_agent(tmp_path, HOLD_PAYLOAD, tradovate=tv)
+    agent.db.record_trade(identifier="t1", symbol="MNQ", action="BUY", contracts=1,
+                          entry_price=100.0)
+    # agent.history["MNQ"] deliberately left empty -- no market data available.
+
+    run(agent.reconcile_positions())
+
+    trades = agent.db.recent_trades(limit=1)
+    assert trades[0]["exit_price"] == pytest.approx(100.0)
+    assert trades[0]["pnl"] == pytest.approx(0.0)
+    agent.db.close()
+
+
+def test_reconcile_sends_a_warning_alert(tmp_path):
+    tv = FakeTradovate()
+    tv.positions = []
+    notifier = FakeNotifier()
+    settings = make_settings(tmp_path)
+    agent = Agent(settings, bars_provider=FakeBarsProvider(candles()),
+                 tradovate_client=tv, ai_client=FakeAIClient(HOLD_PAYLOAD), notifier=notifier)
+    agent.db.record_trade(identifier="t1", symbol="MNQ", action="BUY", contracts=1,
+                          entry_price=100.0)
+
+    run(agent.reconcile_positions())
+
+    assert any("reconciled" in title for _, title, _ in notifier.sent)
+    agent.db.close()
+
+
+def test_reconcile_works_when_execution_is_traderspost(tmp_path):
+    """TradersPost has no position-state API of its own -- reconciliation
+    must still work by going straight to Tradovate's REST API via an
+    explicitly injected position_client, independent of the execution
+    path."""
+    pc = FakeTradovate()
+    pc.positions = []
+    settings = Settings(
+        anthropic_api_key="k", execution_mode="traderspost",
+        traderspost_webhook_url="https://hooks.example/x",
+        traded_symbols=("MNQ",), database_path=str(tmp_path / "agent.db"),
+        kill_switch_file=str(tmp_path / "KILL_SWITCH"), dashboard_port=0,
+        risk=RiskLimits(account_equity=50_000.0, risk_pct_per_trade=0.5),
+    )
+    agent = Agent(settings, bars_provider=FakeBarsProvider(candles()),
+                 ai_client=FakeAIClient(HOLD_PAYLOAD), position_client=pc)
+    agent.db.record_trade(identifier="t1", symbol="MNQ", action="BUY", contracts=1,
+                          entry_price=100.0)
+
+    run(agent.reconcile_positions())
+
+    assert agent.db.open_positions_count() == 0
+    run(agent.close())
 
 
 # --------------------------------------------------------------- lifecycle

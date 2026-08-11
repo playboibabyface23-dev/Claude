@@ -34,7 +34,7 @@ Market data → Indicators → Claude decision engine → Risk manager → Execu
 | `ai/` | The Claude decision engine — one structured-output call per symbol per cycle |
 | `strategies/` | Deterministic reference strategy (confluence counting) used **only** by the backtester as a stand-in for Claude |
 | `risk/` | Hard-capped risk manager: confidence floor, daily loss, trades/day, drawdown, open positions, position sizing, kill switch — plus an optional Lucid/prop-firm eval guard (EOD trailing drawdown, consistency rule) |
-| `execution/` | Tradovate order placement and the TradersPost webhook client, validated and duplicate-safe |
+| `execution/` | Tradovate order placement and the TradersPost webhook client, validated and duplicate-safe; `main.py` reconciles closed positions back into the database (see below) |
 | `database/` | SQLite: trades, AI decision log, rejections, high-water mark, daily equity |
 | `dashboard/` | stdlib HTTP dashboard: positions, balance, P&L, win rate, confidence history, trade history |
 | `notifications/` | External alerting (generic Slack/Discord-compatible webhook) for kill-switch trips, execution failures, and crashes — off unless `ALERT_WEBHOOK_URL` is set |
@@ -153,10 +153,32 @@ round-trip total charged once per closed trade. The report and
 `metrics()` break commission and slippage out from net P&L separately so
 their impact stays visible instead of disappearing into one number.
 
+## Position reconciliation
+
+Nothing else in this file ever calls `db.close_trade()` or
+`execution.submit_exit()` — a bracket/OCO stop or target filled at the
+broker (the TradersPost path, or a fill this process didn't itself
+observe on Tradovate) would otherwise leave the trade recorded `open` in
+the database forever. With the default `MAX_OPEN_POSITIONS=1`, that means
+the agent trades exactly once and then silently refuses every signal
+after, permanently. `Agent.reconcile_positions()` runs every cycle: it
+checks the broker's actual net position (via Tradovate's REST API, shared
+between execution and market data — see `main.py`) for every symbol with
+an open DB trade, and closes it in the database once the broker shows
+flat. The exit price used for P&L is the latest known candle close, not a
+broker-confirmed fill price — Tradovate's fill/order-history endpoints
+weren't something this session could verify live — so it's logged and
+alerted as an **estimate**, and recorded in the `rejections` table as
+`position_reconciled` for audit. Always verify the real fill against the
+broker. This only works when a Tradovate REST session exists (which
+`.env.example` already requires for live market data); the CSV-fallback
+paper path has no way to know broker state and isn't a substitute for
+this in production.
+
 ## Tests
 
 ```bash
-python -m pytest tests/ -v      # 284 tests, fully offline — no API keys or network required
+python -m pytest tests/ -v      # 293 tests, fully offline — no API keys or network required
 ```
 
 Every external integration (Tradovate, TradersPost, Claude) is exercised

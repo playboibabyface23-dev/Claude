@@ -71,7 +71,8 @@ class Agent:
                 traderspost_client: Optional[TradersPostClient] = None,
                 ai_client: Optional[object] = None,
                 live_feed: Optional[TradovateLiveFeed] = None,
-                notifier: Optional[Notifier] = None) -> None:
+                notifier: Optional[Notifier] = None,
+                position_client: Optional[TradovateClient] = None) -> None:
         self.settings = settings
         self.notifier = notifier if notifier is not None else Notifier(settings.alert_webhook_url)
         self.db = Database(settings.database_path)
@@ -87,15 +88,20 @@ class Agent:
             self.traderspost = traderspost_client if traderspost_client is not None \
                 else TradersPostClient(settings.traderspost_webhook_url)
 
-        # Live market data needs its own Tradovate REST session regardless
-        # of execution_mode -- you can execute via TradersPost while still
-        # wanting Tradovate's real data, so this doesn't just reuse
-        # self.tradovate unless execution already built one.
+        # A Tradovate REST session is needed regardless of execution_mode --
+        # for live market data (you can execute via TradersPost while still
+        # wanting Tradovate's real data) and for position reconciliation
+        # below (see reconcile_positions()), which needs to know what the
+        # broker actually holds even when TradersPost placed the order.
+        # Shared across both rather than opening two separate sessions.
+        self.position_client: Optional[TradovateClient] = position_client
+        if self.position_client is None and (self.tradovate is not None or settings.tradovate.configured):
+            self.position_client = self.tradovate or TradovateClient(settings.tradovate)
+
         self.live_feed: Optional[TradovateLiveFeed] = live_feed
         if self.live_feed is None and settings.tradovate.configured:
-            market_data_client = self.tradovate or TradovateClient(settings.tradovate)
             self.live_feed = TradovateLiveFeed(
-                market_data_client, Timeframe.from_minutes(settings.timeframe_minutes))
+                self.position_client, Timeframe.from_minutes(settings.timeframe_minutes))
 
         self.execution = ExecutionEngine(
             settings.execution_mode,
@@ -132,6 +138,8 @@ class Agent:
             await self.live_feed.close()
         if self.tradovate is not None:
             await self.tradovate.close()
+        if self.position_client is not None and self.position_client is not self.tradovate:
+            await self.position_client.close()
         if self.traderspost is not None:
             await self.traderspost.close()
         if self._dashboard_server is not None:
@@ -204,6 +212,81 @@ class Agent:
         reason = "; ".join(f"{f.name}: {f.detail}" for f in verdict.failures)
         self.risk_manager.trip_kill_switch(f"Lucid eval breach — {reason}")
         return reason
+
+    async def reconcile_positions(self) -> None:
+        """Closes trades in the database that the broker no longer shows as
+        open.
+
+        Without this, a bracket/OCO stop or target filled at the broker
+        (the TradersPost path, or a Tradovate-side fill this process didn't
+        itself place) leaves the trade recorded 'open' here forever --
+        nothing else in this file ever calls db.close_trade() or
+        execution.submit_exit(). With the default max_open_positions=1,
+        that means the agent trades exactly once and then silently refuses
+        every signal after, permanently, until someone notices and fixes
+        the database by hand. Runs every cycle; a no-op almost always,
+        since it only acts when the broker's net position for a symbol
+        with an open DB trade has gone flat.
+
+        The exit price used for PnL is the best price this process
+        currently has for that symbol (the latest known candle close), NOT
+        a broker-confirmed fill price -- Tradovate's fill/order-history
+        endpoints were not something this session could verify live (see
+        market/tradovate.py's verification note). This is recorded as an
+        estimate, loudly, not presented as an observed fact: always verify
+        the real fill against the broker before trusting this number.
+        """
+        if self.position_client is None:
+            return
+        open_trades = self.db.open_trades()
+        if not open_trades:
+            return
+        try:
+            account = await self.position_client.get_account()
+            positions = await self.position_client.list_positions(account["id"])
+        except Exception as exc:
+            log.warning("position reconciliation: could not fetch broker positions: %s", exc)
+            return
+
+        by_symbol: dict[str, list[dict]] = {}
+        for trade in open_trades:
+            by_symbol.setdefault(trade["symbol"], []).append(trade)
+
+        for symbol, trades in by_symbol.items():
+            try:
+                contract = await self.position_client.find_contract(symbol)
+            except Exception as exc:
+                log.warning("%s: reconciliation could not resolve contract: %s", symbol, exc)
+                continue
+            net = sum(p.get("netPos", 0) for p in positions if p.get("contractId") == contract["id"])
+            if net != 0:
+                continue   # broker still shows this open -- nothing to reconcile
+
+            history = self.history.get(symbol) or []
+            if history:
+                exit_price = history[-1].close
+                source = "latest known candle close, not a confirmed broker fill"
+            else:
+                exit_price = trades[0]["entry_price"] or 0.0
+                source = "no market data available -- assumed breakeven at entry"
+
+            symbol_spec = get_symbol(symbol)
+            for trade in trades:
+                direction = 1 if trade["action"] == "BUY" else -1
+                entry_price = trade["entry_price"] or exit_price
+                pnl = (exit_price - entry_price) * direction * symbol_spec.multiplier * trade["contracts"]
+                self.db.close_trade(trade["identifier"], exit_price=exit_price, pnl=pnl)
+                self.db.record_rejection(
+                    symbol=symbol, reason="position_reconciled",
+                    detail=f"identifier={trade['identifier']} estimated_pnl={pnl:.2f} ({source})")
+                log.warning(
+                    "%s: broker shows this position flat but the agent never observed the exit -- "
+                    "closed identifier=%s in the database with an ESTIMATED fill (%s), pnl=%.2f. "
+                    "Verify the actual fill against the broker.",
+                    symbol, trade["identifier"], source, pnl)
+                await self.notifier.send(
+                    AlertLevel.WARNING, f"{symbol}: position closed (reconciled, not agent-observed)",
+                    f"identifier={trade['identifier']} estimated_pnl={pnl:.2f} ({source})")
 
     async def run_cycle(self, symbol: str) -> None:
         await self.refresh_history(symbol)
@@ -285,6 +368,11 @@ class Agent:
                 log.error("kill switch auto-tripped (Lucid eval): %s", lucid_reason)
                 await self.notifier.send(
                     AlertLevel.CRITICAL, "Kill switch tripped (Lucid eval)", lucid_reason)
+
+            try:
+                await self.reconcile_positions()
+            except Exception as exc:   # must not block new signals from being evaluated
+                log_error("reconcile_positions", exc)
 
             for symbol in self.settings.traded_symbols:
                 try:

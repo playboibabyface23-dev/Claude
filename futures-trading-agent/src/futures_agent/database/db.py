@@ -128,6 +128,15 @@ class Database:
             "SELECT COUNT(*) AS n FROM trades WHERE status = 'open'").fetchone()
         return row["n"]
 
+    def open_trades(self, symbol: Optional[str] = None) -> list[dict]:
+        if symbol:
+            rows = self._conn.execute(
+                "SELECT * FROM trades WHERE status = 'open' AND symbol = ?",
+                (symbol.upper(),)).fetchall()
+        else:
+            rows = self._conn.execute("SELECT * FROM trades WHERE status = 'open'").fetchall()
+        return [dict(r) for r in rows]
+
     def trades_today(self, since: Optional[str] = None) -> int:
         since = since or _today_start()
         row = self._conn.execute(
