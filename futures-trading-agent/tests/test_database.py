@@ -138,6 +138,39 @@ def test_update_high_water_mark_ratchets_up_only(db):
 
 # --------------------------------------------------------------- persistence
 
+# --------------------------------------------------------------- daily equity
+
+def test_record_daily_equity_upserts_same_day(db):
+    db.record_daily_equity("2026-08-10", 50_000.0)
+    db.record_daily_equity("2026-08-10", 50_500.0)   # same day, later snapshot
+    history = db.daily_equity_history()
+    assert len(history) == 1
+    assert history[0]["equity"] == 50_500.0
+
+
+def test_daily_equity_history_orders_ascending_by_date(db):
+    db.record_daily_equity("2026-08-11", 51_000.0)
+    db.record_daily_equity("2026-08-10", 50_000.0)
+    history = db.daily_equity_history()
+    assert [h["date"] for h in history] == ["2026-08-10", "2026-08-11"]
+
+
+def test_realized_pnl_by_day_groups_and_sums_closed_trades(db):
+    insert_trade(db, "t1")
+    insert_trade(db, "t2")
+    db.close_trade("t1", exit_price=20050.0, pnl=100.0)
+    db.close_trade("t2", exit_price=19950.0, pnl=-40.0)
+    today = datetime.now(timezone.utc).date().isoformat()
+    by_day = db.realized_pnl_by_day()
+    assert by_day[today] == pytest.approx(60.0)
+
+
+def test_realized_pnl_by_day_excludes_open_trades(db):
+    insert_trade(db, "t1")   # never closed
+    by_day = db.realized_pnl_by_day()
+    assert by_day == {}
+
+
 def test_data_persists_across_reopening_the_same_file(tmp_path):
     path = str(tmp_path / "persist.db")
     db1 = Database(path)

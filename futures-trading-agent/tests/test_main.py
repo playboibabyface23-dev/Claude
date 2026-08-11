@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from futures_agent.config.settings import RiskLimits, Settings
+from futures_agent.config.settings import LucidEvalSettings, RiskLimits, Settings
 from futures_agent.main import Agent, MIN_BARS_TO_ANALYZE
 from futures_agent.market.models import Candle
 
@@ -106,13 +106,14 @@ BUY_PAYLOAD = {"symbol": "MNQ", "action": "BUY", "confidence": 90,
               "entry_reason": "confluence", "stop_loss": 20, "take_profit": 60}
 
 
-def make_settings(tmp_path, **risk_kw) -> Settings:
+def make_settings(tmp_path, lucid: LucidEvalSettings | None = None, **risk_kw) -> Settings:
     return Settings(
         anthropic_api_key="k", execution_mode="tradovate",
         traded_symbols=("MNQ",), database_path=str(tmp_path / "agent.db"),
         kill_switch_file=str(tmp_path / "KILL_SWITCH"),
         dashboard_port=0,   # OS-assigned ephemeral port, avoids test collisions
         risk=RiskLimits(account_equity=50_000.0, risk_pct_per_trade=0.5, **risk_kw),
+        lucid=lucid or LucidEvalSettings(),
     )
 
 
@@ -209,6 +210,66 @@ def test_max_open_positions_blocks_a_second_entry_same_symbol(tmp_path):
     rejections = agent.db.recent_rejections()
     assert rejections[0]["reason"] == "max_open_positions"
     agent.db.close()
+
+
+# --------------------------------------------------------------- Lucid eval guard
+
+def test_lucid_guard_not_built_when_disabled(tmp_path):
+    agent, _ = make_agent(tmp_path, HOLD_PAYLOAD)
+    assert agent.lucid_guard is None
+    assert agent._check_lucid_eval() is None
+    agent.db.close()
+
+
+def test_lucid_guard_built_when_enabled(tmp_path):
+    settings = make_settings(tmp_path, lucid=LucidEvalSettings(enabled=True))
+    agent = Agent(settings, bars_provider=FakeBarsProvider(candles()),
+                 tradovate_client=FakeTradovate(), ai_client=FakeAIClient(HOLD_PAYLOAD))
+    assert agent.lucid_guard is not None
+    agent.db.close()
+
+
+def test_lucid_guard_trips_kill_switch_on_trailing_drawdown_breach(tmp_path):
+    settings = make_settings(tmp_path, lucid=LucidEvalSettings(
+        enabled=True, starting_balance=50_000.0, trailing_drawdown_amount=2_000.0))
+    agent = Agent(settings, bars_provider=FakeBarsProvider(candles()),
+                 tradovate_client=FakeTradovate(), ai_client=FakeAIClient(HOLD_PAYLOAD))
+    agent.db.record_daily_equity("2020-01-01", 52_000.0)   # highest EOD close so far
+    agent._equity = 49_500.0   # below the 50,000 trailing floor (52,000 - 2,000)
+    reason = agent._check_lucid_eval()
+    assert reason is not None
+    assert "trailing_drawdown" in reason
+    assert agent.risk_manager.kill_switch_active()
+    agent.db.close()
+
+
+def test_lucid_guard_approves_when_within_limits(tmp_path):
+    settings = make_settings(tmp_path, lucid=LucidEvalSettings(enabled=True))
+    agent = Agent(settings, bars_provider=FakeBarsProvider(candles()),
+                 tradovate_client=FakeTradovate(), ai_client=FakeAIClient(HOLD_PAYLOAD))
+    assert agent._check_lucid_eval() is None
+    assert not agent.risk_manager.kill_switch_active()
+    agent.db.close()
+
+
+def test_run_forever_records_daily_equity_each_cycle(tmp_path):
+    settings = make_settings(tmp_path)
+    agent = Agent(settings, bars_provider=FakeBarsProvider(candles()),
+                 tradovate_client=FakeTradovate(), ai_client=FakeAIClient(HOLD_PAYLOAD))
+
+    original_run_cycle = agent.run_cycle
+
+    async def run_cycle_then_stop(symbol):
+        await original_run_cycle(symbol)
+        agent.stop()   # let the loop finish this iteration's bookkeeping, then exit
+
+    agent.run_cycle = run_cycle_then_stop
+    run(agent.run_forever())
+
+    today = datetime.now(UTC).date().isoformat()
+    history = agent.db.daily_equity_history()
+    assert any(h["date"] == today for h in history)
+    run(agent.close())
 
 
 # --------------------------------------------------------------- lifecycle

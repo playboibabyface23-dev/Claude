@@ -124,6 +124,35 @@ class TradovateCredentials:
 
 
 @dataclass(frozen=True)
+class LucidEvalSettings:
+    """Off by default -- enable only for a Lucid (or Lucid-shaped) prop-firm
+    evaluation account. See risk/lucid_eval.py's module docstring for what
+    is and isn't confirmed about these numbers."""
+
+    enabled: bool = False
+    starting_balance: float = 50_000.0
+    trailing_drawdown_amount: float = 2_000.0
+    profit_target: float = 3_000.0
+    max_consistency_pct: float = 30.0
+    min_trading_days: int = 0
+
+    @classmethod
+    def from_env(cls) -> "LucidEvalSettings":
+        return cls(
+            enabled=_env_bool("LUCID_EVAL_ENABLED", cls.enabled),
+            starting_balance=_env_float("LUCID_STARTING_BALANCE", cls.starting_balance),
+            trailing_drawdown_amount=_env_float(
+                "LUCID_TRAILING_DRAWDOWN_AMOUNT", cls.trailing_drawdown_amount
+            ),
+            profit_target=_env_float("LUCID_PROFIT_TARGET", cls.profit_target),
+            max_consistency_pct=_env_float(
+                "LUCID_MAX_CONSISTENCY_PCT", cls.max_consistency_pct
+            ),
+            min_trading_days=_env_int("LUCID_MIN_TRADING_DAYS", cls.min_trading_days),
+        )
+
+
+@dataclass(frozen=True)
 class Settings:
     anthropic_api_key: str = ""
     claude_model: str = "claude-fable-5"
@@ -142,6 +171,7 @@ class Settings:
     historical_bars_csv_template: str = ""
 
     risk: RiskLimits = field(default_factory=RiskLimits)
+    lucid: LucidEvalSettings = field(default_factory=LucidEvalSettings)
     kill_switch_file: str = "logs/KILL_SWITCH"
 
     database_path: str = "database/futures_agent.db"
@@ -168,6 +198,7 @@ class Settings:
                 "HISTORICAL_BARS_CSV_TEMPLATE", cls.historical_bars_csv_template
             ),
             risk=RiskLimits.from_env(),
+            lucid=LucidEvalSettings.from_env(),
             kill_switch_file=_env_str("KILL_SWITCH_FILE", cls.kill_switch_file),
             database_path=_env_str("DATABASE_PATH", cls.database_path),
             dashboard_host=_env_str("DASHBOARD_HOST", cls.dashboard_host),

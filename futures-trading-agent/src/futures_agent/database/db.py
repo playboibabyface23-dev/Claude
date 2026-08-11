@@ -57,6 +57,15 @@ CREATE TABLE IF NOT EXISTS kv (
     key TEXT PRIMARY KEY,
     value REAL NOT NULL
 );
+
+-- One row per UTC calendar day: the closing equity snapshot main.py records
+-- on day rollover. This is what prop-firm EOD trailing-drawdown rules (see
+-- risk/lucid_eval.py) actually key off of -- not any intraday equity peak.
+CREATE TABLE IF NOT EXISTS daily_equity (
+    date TEXT PRIMARY KEY,
+    equity REAL NOT NULL,
+    recorded_at TEXT NOT NULL
+);
 """
 
 
@@ -208,3 +217,30 @@ class Database:
         )
         self._conn.commit()
         return new_hwm
+
+    # ------------------------------------------------------------ daily equity (EOD snapshots)
+
+    def record_daily_equity(self, date_str: str, equity: float) -> None:
+        """Upsert — safe to call more than once for the same day (e.g. a
+        restart mid-day should not create a duplicate row)."""
+        self._conn.execute(
+            "INSERT INTO daily_equity (date, equity, recorded_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(date) DO UPDATE SET equity = excluded.equity, "
+            "recorded_at = excluded.recorded_at",
+            (date_str, equity, _now()),
+        )
+        self._conn.commit()
+
+    def daily_equity_history(self, limit: int = 400) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM daily_equity ORDER BY date ASC LIMIT ?", (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def realized_pnl_by_day(self, limit_days: int = 400) -> dict[str, float]:
+        """UTC calendar day -> realized P&L closed that day. Powers the
+        Lucid eval consistency-rule check (risk/lucid_eval.py)."""
+        rows = self._conn.execute(
+            "SELECT substr(closed_at, 1, 10) AS day, COALESCE(SUM(pnl), 0.0) AS total "
+            "FROM trades WHERE status = 'closed' AND closed_at IS NOT NULL "
+            "GROUP BY day ORDER BY day DESC LIMIT ?", (limit_days,)).fetchall()
+        return {r["day"]: r["total"] for r in rows}

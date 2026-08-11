@@ -1,4 +1,10 @@
-from futures_agent.config import RiskLimits, Settings, TradovateCredentials, get_symbol
+from futures_agent.config import (
+    LucidEvalSettings,
+    RiskLimits,
+    Settings,
+    TradovateCredentials,
+    get_symbol,
+)
 from futures_agent.config.symbols import SYMBOL_CATALOG
 
 
@@ -68,3 +74,20 @@ def test_dollar_risk_matches_hand_calculation():
 def test_risk_limits_from_env_uses_defaults_when_unset(tmp_env):
     limits = RiskLimits.from_env()
     assert limits.account_equity == RiskLimits().account_equity
+
+
+def test_lucid_eval_disabled_by_default():
+    assert Settings().lucid.enabled is False
+
+
+def test_lucid_eval_settings_from_env(tmp_env, monkeypatch):
+    monkeypatch.setenv("LUCID_EVAL_ENABLED", "true")
+    monkeypatch.setenv("LUCID_STARTING_BALANCE", "100000")
+    s = Settings.from_env()
+    assert s.lucid.enabled is True
+    assert s.lucid.starting_balance == 100_000.0
+
+
+def test_lucid_eval_settings_from_env_defaults_when_unset(tmp_env):
+    s = LucidEvalSettings.from_env()
+    assert s == LucidEvalSettings()

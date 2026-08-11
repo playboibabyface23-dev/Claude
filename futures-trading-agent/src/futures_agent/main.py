@@ -44,6 +44,7 @@ from .market.indicators import compute_snapshot
 from .market.models import Candle, Timeframe
 from .market.tradovate import TradovateClient
 from .market.tradovate_ws import TradovateLiveFeed
+from .risk.lucid_eval import LucidEvalConfig, LucidEvalGuard
 from .risk.manager import AccountState, RiskManager
 
 log = logging.getLogger("futures_agent.main")
@@ -99,6 +100,16 @@ class Agent:
             traderspost_client=self.traderspost,
             duplicate_check=self.db.has_trade,
         )
+
+        self.lucid_guard: Optional[LucidEvalGuard] = None
+        if settings.lucid.enabled:
+            self.lucid_guard = LucidEvalGuard(LucidEvalConfig(
+                starting_balance=settings.lucid.starting_balance,
+                trailing_drawdown_amount=settings.lucid.trailing_drawdown_amount,
+                profit_target=settings.lucid.profit_target,
+                max_consistency_pct=settings.lucid.max_consistency_pct,
+                min_trading_days=settings.lucid.min_trading_days,
+            ))
 
         self.ai_engine = AIDecisionEngine(settings, client=ai_client)
         self.snapshot_store = SnapshotStore()
@@ -166,6 +177,29 @@ class Agent:
             trades_today=self.db.trades_today(),
             open_positions=self.db.open_positions_count(),
         )
+
+    def _check_lucid_eval(self) -> Optional[str]:
+        """Mirrors risk_manager.check_and_trip_if_breached, but for the
+        Lucid prop-firm eval rules (see risk/lucid_eval.py) -- disabled
+        unless LUCID_EVAL_ENABLED is set. A breach here trips the same
+        file-based kill switch, since a trailing-drawdown or consistency
+        violation is typically a hard, immediate eval-failure condition,
+        not just a single rejected trade."""
+        if self.lucid_guard is None:
+            return None
+        today = datetime.now(timezone.utc).date().isoformat()
+        eod_closes = [row["equity"] for row in self.db.daily_equity_history()
+                     if row["date"] != today]
+        pnl_by_day = self.db.realized_pnl_by_day()
+        verdict = self.lucid_guard.evaluate(
+            current_equity=self._equity, eod_closes=eod_closes,
+            pnl_by_day=pnl_by_day, trading_days=len(pnl_by_day),
+        )
+        if verdict.approved:
+            return None
+        reason = "; ".join(f"{f.name}: {f.detail}" for f in verdict.failures)
+        self.risk_manager.trip_kill_switch(f"Lucid eval breach — {reason}")
+        return reason
 
     async def run_cycle(self, symbol: str) -> None:
         await self.refresh_history(symbol)
@@ -236,6 +270,10 @@ class Agent:
             if reason:
                 log.error("kill switch auto-tripped: %s", reason)
 
+            lucid_reason = self._check_lucid_eval()
+            if lucid_reason:
+                log.error("kill switch auto-tripped (Lucid eval): %s", lucid_reason)
+
             for symbol in self.settings.traded_symbols:
                 try:
                     await self.run_cycle(symbol)
@@ -243,6 +281,8 @@ class Agent:
                     log_error(f"run_cycle:{symbol}", exc)
 
             self._high_water_mark = self.db.update_high_water_mark(self._equity)
+            today = datetime.now(timezone.utc).date().isoformat()
+            self.db.record_daily_equity(today, self._equity)
             self.snapshot_store.set(build_snapshot(
                 self.db, self._account_state(), running=self._running,
                 kill_switch_active=self.risk_manager.kill_switch_active(),

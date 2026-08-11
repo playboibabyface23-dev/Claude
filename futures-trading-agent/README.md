@@ -33,7 +33,7 @@ Market data → Indicators → Claude decision engine → Risk manager → Execu
 | `market/` | Tradovate REST connector, tick→candle aggregation, session/prior-day levels, indicators (EMA/ATR/RSI/VWAP/relative volume/structure) |
 | `ai/` | The Claude decision engine — one structured-output call per symbol per cycle |
 | `strategies/` | Deterministic reference strategy (confluence counting) used **only** by the backtester as a stand-in for Claude |
-| `risk/` | Hard-capped risk manager: confidence floor, daily loss, trades/day, drawdown, open positions, position sizing, kill switch |
+| `risk/` | Hard-capped risk manager: confidence floor, daily loss, trades/day, drawdown, open positions, position sizing, kill switch — plus an optional Lucid/prop-firm eval guard (EOD trailing drawdown, consistency rule) |
 | `execution/` | Tradovate order placement and the TradersPost webhook client, validated and duplicate-safe |
 | `database/` | SQLite: trades, AI decision log, rejections, high-water mark |
 | `dashboard/` | stdlib HTTP dashboard: positions, balance, P&L, win rate, confidence history, trade history |
@@ -128,7 +128,7 @@ never counted as a win.
 ## Tests
 
 ```bash
-python -m pytest tests/ -v      # 233 tests, fully offline — no API keys or network required
+python -m pytest tests/ -v      # 261 tests, fully offline — no API keys or network required
 ```
 
 Every external integration (Tradovate, TradersPost, Claude) is exercised
@@ -159,6 +159,16 @@ end-to-end without touching the network (see `tests/test_main.py`).
 5. **Duplicate-order prevention** — `execution/engine.py` refuses to resend
    an identifier it has already submitted, backed by the database (not just
    process memory) via an injectable `duplicate_check`.
+6. **Lucid/prop-firm eval guard (optional)** — `risk/lucid_eval.py`, off by
+   default (`LUCID_EVAL_ENABLED=false`). When enabled, `main.py` records a
+   closing equity snapshot every cycle (`database/db.py`'s `daily_equity`
+   table) and checks it every cycle against an EOD trailing-drawdown floor
+   and a consistency-rule cap — a breach trips the same kill switch as the
+   generic risk caps above. **The trailing-drawdown amount is taken from a
+   real Lucid account summary; the consistency percentage is an
+   unconfirmed placeholder.** Read that module's docstring and confirm
+   every threshold against Lucid's actual published rules before this is
+   trusted with a real evaluation fee.
 
 > Research and paper-trading scaffold. Not financial advice. Confirm
 > `TRADOVATE_ENV=demo` and test thoroughly before ever pointing this at a
