@@ -59,6 +59,10 @@ log = logging.getLogger("futures_agent.tradovate_ws")
 MD_WS_URL = "wss://md.tradovateapi.com/v1/websocket"
 HEARTBEAT_INTERVAL_SECONDS = 2.5
 HEARTBEAT_FRAME = "[]"
+# How often TradovateLiveFeed's watchdog checks for a dropped connection and
+# reconnects. Not the same as HEARTBEAT_INTERVAL_SECONDS -- that keeps an
+# already-good connection alive; this notices when it stopped being good.
+RECONNECT_CHECK_SECONDS = 10.0
 
 
 class TradovateWSError(RuntimeError):
@@ -159,6 +163,13 @@ class TradovateMarketDataSocket:
         self._auth_error: Optional[BaseException] = None
         self._last_heartbeat_sent = 0.0
         self._reader_task: Optional[asyncio.Task] = None
+        # Set once the read loop exits for any reason (server closed the
+        # socket, network dropped, an unexpected exception) -- including on
+        # an intentional close(). TradovateLiveFeed's watchdog polls this to
+        # notice a dead connection and reconnect; a deliberate shutdown sets
+        # it too, but by then the watchdog has already been cancelled by
+        # LiveFeed.close(), so nothing acts on it.
+        self.disconnected = asyncio.Event()
 
     # ------------------------------------------------------------ lifecycle
 
@@ -202,6 +213,8 @@ class TradovateMarketDataSocket:
             for future in self._pending.values():
                 if not future.done():
                     future.set_exception(TradovateWSError(f"connection lost: {exc}"))
+        finally:
+            self.disconnected.set()
 
     # ------------------------------------------------------------ frame handling
 
@@ -412,18 +425,33 @@ class TradovateLiveFeed:
     One instance serves every traded symbol over a single shared WebSocket
     connection — `start()` is idempotent per symbol, so main.py can call it
     once per cycle without re-subscribing.
+
+    A background watchdog notices when that shared connection drops (network
+    blip, server-side restart, anything) and reconnects automatically,
+    re-subscribing every symbol that was previously active. This is what
+    makes the feed survive unattended over a 24/7 run instead of going
+    silently stale the first time the socket dies — before this, a dropped
+    connection meant this feed simply stopped delivering new bars for the
+    rest of the process's life, with nothing surfacing the failure. A brief
+    gap in bars during the outage is expected and not backfilled; the next
+    successful `start()` re-warms history via `get_chart` from the current
+    moment, not from where the gap began.
     """
 
     def __init__(self, rest_client: Any, timeframe: Timeframe, max_bars: int = 500,
-                socket_factory: Optional[Callable[[str], "TradovateMarketDataSocket"]] = None) -> None:
+                socket_factory: Optional[Callable[[str], "TradovateMarketDataSocket"]] = None,
+                reconnect_check_seconds: float = RECONNECT_CHECK_SECONDS) -> None:
         self._rest_client = rest_client
         self._timeframe = timeframe
         self._max_bars = max_bars
         self._socket_factory = socket_factory or TradovateMarketDataSocket
+        self._reconnect_check_seconds = reconnect_check_seconds
         self._socket: Optional[TradovateMarketDataSocket] = None
         self._aggregators: dict[str, CandleAggregator] = {}
         self._history: dict[str, list[Candle]] = {}
         self._tasks: dict[str, asyncio.Task] = {}
+        self._active_symbols: set[str] = set()
+        self._watchdog_task: Optional[asyncio.Task] = None
 
     async def _ensure_socket(self) -> TradovateMarketDataSocket:
         if self._socket is None:
@@ -433,6 +461,9 @@ class TradovateLiveFeed:
         return self._socket
 
     async def start(self, symbol: str) -> None:
+        self._active_symbols.add(symbol)
+        if self._watchdog_task is None:
+            self._watchdog_task = asyncio.create_task(self._watchdog())
         if symbol in self._tasks:
             return
         socket = await self._ensure_socket()
@@ -472,7 +503,44 @@ class TradovateLiveFeed:
     def candles(self, symbol: str) -> list[Candle]:
         return list(self._history.get(symbol, []))
 
+    # ------------------------------------------------------------ reconnect
+
+    async def _watchdog(self) -> None:
+        while True:
+            await asyncio.sleep(self._reconnect_check_seconds)
+            if self._active_symbols and (
+                self._socket is None or self._socket.disconnected.is_set()
+            ):
+                await self._reconnect()
+
+    async def _reconnect(self) -> None:
+        log.warning("Tradovate market data connection dropped -- reconnecting")
+        for task in self._tasks.values():
+            task.cancel()
+        self._tasks.clear()
+        old_socket, self._socket = self._socket, None
+        if old_socket is not None:
+            try:
+                await old_socket.close()
+            except Exception:
+                pass
+        for symbol in list(self._active_symbols):
+            try:
+                await self.start(symbol)
+            except Exception as exc:
+                log.error("%s: reconnect attempt failed, will retry: %s", symbol, exc)
+                # Force a fresh connect attempt next watchdog tick rather
+                # than getting stuck on a half-built, never-connected socket.
+                self._socket = None
+
     async def close(self) -> None:
+        self._active_symbols.clear()
+        if self._watchdog_task is not None:
+            self._watchdog_task.cancel()
+            try:
+                await self._watchdog_task
+            except (asyncio.CancelledError, Exception):
+                pass
         for task in self._tasks.values():
             task.cancel()
         for task in self._tasks.values():

@@ -422,6 +422,7 @@ class FakeLiveFeedSocket:
         self.subscribe_calls: list[tuple] = []
         self._callback = None
         self.closed = False
+        self.disconnected = asyncio.Event()
 
     async def connect(self) -> None:
         self.connected = True
@@ -564,3 +565,93 @@ def test_live_feed_candles_empty_for_unstarted_symbol():
     rest = FakeRestClient()
     feed = TradovateLiveFeed(rest, Timeframe.M1)
     assert feed.candles("NEVERSTARTED") == []
+
+
+# --------------------------------------------------------------- reconnect
+
+def test_live_feed_reconnects_after_disconnect_and_resubscribes():
+    async def scenario():
+        rest = FakeRestClient(contract_id=7)
+        made = []
+
+        def factory(token):
+            s = FakeLiveFeedSocket(token)
+            s.warmup = [make_candle(0)]
+            made.append(s)
+            return s
+
+        feed = TradovateLiveFeed(rest, Timeframe.M1, socket_factory=factory,
+                                 reconnect_check_seconds=0.01)
+        await feed.start("MNQZ1")
+        first_socket = made[0]
+        assert len(made) == 1
+
+        first_socket.disconnected.set()   # simulate the connection dropping
+        await asyncio.sleep(0.05)         # let the watchdog notice and reconnect
+
+        assert len(made) == 2   # a fresh socket was built
+        second_socket = made[1]
+        assert second_socket.connected
+        assert second_socket.subscribe_calls == [("MNQZ1", 7)]
+        assert first_socket.closed   # the dead socket was cleaned up
+
+        await feed.close()
+
+    run(scenario())
+
+
+def test_live_feed_reconnect_retries_on_failure(monkeypatch):
+    async def scenario():
+        attempts = {"n": 0}
+
+        class FlakyRestClient(FakeRestClient):
+            async def get_access_token(self) -> str:
+                attempts["n"] += 1
+                if attempts["n"] == 2:   # fail exactly once, during reconnect
+                    raise RuntimeError("token endpoint unavailable")
+                return "tok123"
+
+        rest = FlakyRestClient(contract_id=7)
+        made = []
+
+        def factory(token):
+            s = FakeLiveFeedSocket(token)
+            made.append(s)
+            return s
+
+        feed = TradovateLiveFeed(rest, Timeframe.M1, socket_factory=factory,
+                                 reconnect_check_seconds=0.01)
+        await feed.start("MNQZ1")
+        made[0].disconnected.set()
+
+        await asyncio.sleep(0.05)    # first reconnect attempt fails
+        await asyncio.sleep(0.05)    # second watchdog tick succeeds
+
+        assert len(made) == 2
+        assert made[1].connected
+        assert feed.candles("MNQZ1") == []   # no warmup configured on the fake, just no crash
+
+        await feed.close()
+
+    run(scenario())
+
+
+def test_live_feed_watchdog_does_nothing_while_connection_is_healthy():
+    async def scenario():
+        rest = FakeRestClient(contract_id=7)
+        made = []
+
+        def factory(token):
+            s = FakeLiveFeedSocket(token)
+            made.append(s)
+            return s
+
+        feed = TradovateLiveFeed(rest, Timeframe.M1, socket_factory=factory,
+                                 reconnect_check_seconds=0.01)
+        await feed.start("MNQZ1")
+        await asyncio.sleep(0.05)   # several watchdog ticks with no disconnect
+        assert len(made) == 1       # no reconnect happened
+
+        await feed.close()
+
+    run(scenario())

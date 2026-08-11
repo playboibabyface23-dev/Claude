@@ -65,6 +65,14 @@ warmup (`get_chart`) with live tick aggregation (`subscribe_quote` →
 wire up real demo credentials and watch its output before trusting it with
 a funded account.
 
+`TradovateLiveFeed` also watches its own connection: a background watchdog
+(`market/tradovate_ws.py`) checks every 10 seconds whether the shared
+WebSocket has dropped and, if so, reconnects and re-subscribes every symbol
+that was active — without this, a single network blip during a 24/7 run
+would have silently stopped new bars from arriving for the rest of the
+process's life, with nothing surfacing the failure. A brief gap in bars
+during the outage itself is expected and not backfilled.
+
 When Tradovate credentials are configured, `main.py`'s `Agent` builds a
 `TradovateLiveFeed` automatically — no separate flag needed. Without them,
 set `HISTORICAL_BARS_CSV_TEMPLATE` to poll a CSV each cycle instead
@@ -128,7 +136,7 @@ never counted as a win.
 ## Tests
 
 ```bash
-python -m pytest tests/ -v      # 261 tests, fully offline — no API keys or network required
+python -m pytest tests/ -v      # 264 tests, fully offline — no API keys or network required
 ```
 
 Every external integration (Tradovate, TradersPost, Claude) is exercised
