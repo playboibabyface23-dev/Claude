@@ -44,6 +44,7 @@ from .market.indicators import compute_snapshot
 from .market.models import Candle, Timeframe
 from .market.tradovate import TradovateClient
 from .market.tradovate_ws import TradovateLiveFeed
+from .notifications.alerts import AlertLevel, Notifier
 from .risk.lucid_eval import LucidEvalConfig, LucidEvalGuard
 from .risk.manager import AccountState, RiskManager
 
@@ -69,8 +70,10 @@ class Agent:
                 tradovate_client: Optional[TradovateClient] = None,
                 traderspost_client: Optional[TradersPostClient] = None,
                 ai_client: Optional[object] = None,
-                live_feed: Optional[TradovateLiveFeed] = None) -> None:
+                live_feed: Optional[TradovateLiveFeed] = None,
+                notifier: Optional[Notifier] = None) -> None:
         self.settings = settings
+        self.notifier = notifier if notifier is not None else Notifier(settings.alert_webhook_url)
         self.db = Database(settings.database_path)
         self.risk_manager = RiskManager(settings.risk, kill_switch_file=settings.kill_switch_file)
         self.bars_provider = bars_provider if bars_provider is not None else build_bars_provider(settings)
@@ -124,6 +127,7 @@ class Agent:
         self._dashboard_server = None
 
     async def close(self) -> None:
+        await self.notifier.close()
         if self.live_feed is not None:
             await self.live_feed.close()
         if self.tradovate is not None:
@@ -248,6 +252,7 @@ class Agent:
         except (OrderValidationError, DuplicateOrderError, ExecutionError) as exc:
             log.error("%s: execution failed: %s", symbol, exc)
             self.db.record_rejection(symbol=symbol, reason="execution_error", detail=str(exc))
+            await self.notifier.send(AlertLevel.WARNING, f"{symbol}: execution failed", str(exc))
             return
 
         self.db.record_trade(
@@ -265,20 +270,29 @@ class Agent:
         self._dashboard_server = serve(
             self.snapshot_store, self.settings.dashboard_host, self.settings.dashboard_port)
 
+        if self.notifier.enabled:
+            await self.notifier.send(AlertLevel.INFO, "Futures agent started",
+                                     f"symbols={list(self.settings.traded_symbols)}")
+
         while self._running:
             reason = self.risk_manager.check_and_trip_if_breached(self._account_state())
             if reason:
                 log.error("kill switch auto-tripped: %s", reason)
+                await self.notifier.send(AlertLevel.CRITICAL, "Kill switch tripped", reason)
 
             lucid_reason = self._check_lucid_eval()
             if lucid_reason:
                 log.error("kill switch auto-tripped (Lucid eval): %s", lucid_reason)
+                await self.notifier.send(
+                    AlertLevel.CRITICAL, "Kill switch tripped (Lucid eval)", lucid_reason)
 
             for symbol in self.settings.traded_symbols:
                 try:
                     await self.run_cycle(symbol)
                 except Exception as exc:   # a single symbol's failure must not kill the loop
                     log_error(f"run_cycle:{symbol}", exc)
+                    await self.notifier.send(
+                        AlertLevel.CRITICAL, f"{symbol}: unhandled cycle error", str(exc))
 
             self._high_water_mark = self.db.update_high_water_mark(self._equity)
             today = datetime.now(timezone.utc).date().isoformat()
@@ -293,6 +307,8 @@ class Agent:
             await asyncio.sleep(self.settings.poll_interval_seconds)
 
         log_restart("shutdown")
+        if self.notifier.enabled:
+            await self.notifier.send(AlertLevel.WARNING, "Futures agent stopped", "")
 
 
 async def main_async() -> int:

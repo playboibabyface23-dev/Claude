@@ -91,3 +91,13 @@ def test_lucid_eval_settings_from_env(tmp_env, monkeypatch):
 def test_lucid_eval_settings_from_env_defaults_when_unset(tmp_env):
     s = LucidEvalSettings.from_env()
     assert s == LucidEvalSettings()
+
+
+def test_alert_webhook_url_defaults_empty():
+    assert Settings().alert_webhook_url == ""
+
+
+def test_alert_webhook_url_from_env(tmp_env, monkeypatch):
+    monkeypatch.setenv("ALERT_WEBHOOK_URL", "https://hooks.example/webhook")
+    s = Settings.from_env()
+    assert s.alert_webhook_url == "https://hooks.example/webhook"

@@ -11,6 +11,7 @@ import pytest
 from futures_agent.config.settings import LucidEvalSettings, RiskLimits, Settings
 from futures_agent.main import Agent, MIN_BARS_TO_ANALYZE
 from futures_agent.market.models import Candle
+from futures_agent.notifications.alerts import AlertLevel
 
 UTC = timezone.utc
 
@@ -94,6 +95,19 @@ class FakeTradovate:
 
     async def list_positions(self, account_id):
         return []
+
+    async def close(self):
+        self.closed = True
+
+
+class FakeNotifier:
+    def __init__(self) -> None:
+        self.sent: list[tuple] = []
+        self.enabled = True
+        self.closed = False
+
+    async def send(self, level, title, detail=""):
+        self.sent.append((level, title, detail))
 
     async def close(self):
         self.closed = True
@@ -270,6 +284,53 @@ def test_run_forever_records_daily_equity_each_cycle(tmp_path):
     history = agent.db.daily_equity_history()
     assert any(h["date"] == today for h in history)
     run(agent.close())
+
+
+# --------------------------------------------------------------- alerting
+
+def test_execution_failure_sends_a_warning_alert(tmp_path):
+    tv = FakeTradovate(raise_on_place=RuntimeError("margin call"))
+    settings = make_settings(tmp_path)
+    notifier = FakeNotifier()
+    agent = Agent(settings, bars_provider=FakeBarsProvider(candles()),
+                 tradovate_client=tv, ai_client=FakeAIClient(BUY_PAYLOAD), notifier=notifier)
+    run(agent.run_cycle("MNQ"))
+    assert notifier.sent
+    level, title, detail = notifier.sent[0]
+    assert level == AlertLevel.WARNING
+    assert "execution failed" in title
+    agent.db.close()
+
+
+def test_kill_switch_trip_sends_a_critical_alert(tmp_path):
+    settings = make_settings(tmp_path, max_daily_loss_pct=0.01)   # trips immediately on any loss
+    notifier = FakeNotifier()
+    agent = Agent(settings, bars_provider=FakeBarsProvider(candles()),
+                 tradovate_client=FakeTradovate(), ai_client=FakeAIClient(HOLD_PAYLOAD),
+                 notifier=notifier)
+    agent.db.record_trade(identifier="t1", symbol="MNQ", action="BUY", contracts=1)
+    agent.db.close_trade("t1", exit_price=19000.0, pnl=-500.0)
+
+    original_run_cycle = agent.run_cycle
+
+    async def run_cycle_then_stop(symbol):
+        await original_run_cycle(symbol)
+        agent.stop()
+
+    agent.run_cycle = run_cycle_then_stop
+    run(agent.run_forever())
+
+    critical = [s for s in notifier.sent if s[0] == AlertLevel.CRITICAL]
+    assert any("Kill switch tripped" in title for _, title, _ in critical)
+    run(agent.close())
+
+
+def test_notifier_closed_on_agent_close(tmp_path):
+    agent, tv = make_agent(tmp_path, HOLD_PAYLOAD)
+    notifier = FakeNotifier()
+    agent.notifier = notifier
+    run(agent.close())
+    assert notifier.closed
 
 
 # --------------------------------------------------------------- lifecycle

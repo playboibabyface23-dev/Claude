@@ -35,8 +35,9 @@ Market data → Indicators → Claude decision engine → Risk manager → Execu
 | `strategies/` | Deterministic reference strategy (confluence counting) used **only** by the backtester as a stand-in for Claude |
 | `risk/` | Hard-capped risk manager: confidence floor, daily loss, trades/day, drawdown, open positions, position sizing, kill switch — plus an optional Lucid/prop-firm eval guard (EOD trailing drawdown, consistency rule) |
 | `execution/` | Tradovate order placement and the TradersPost webhook client, validated and duplicate-safe |
-| `database/` | SQLite: trades, AI decision log, rejections, high-water mark |
+| `database/` | SQLite: trades, AI decision log, rejections, high-water mark, daily equity |
 | `dashboard/` | stdlib HTTP dashboard: positions, balance, P&L, win rate, confidence history, trade history |
+| `notifications/` | External alerting (generic Slack/Discord-compatible webhook) for kill-switch trips, execution failures, and crashes — off unless `ALERT_WEBHOOK_URL` is set |
 | `backtesting/` | Replays history through the real risk manager and position management |
 | `powershell/` | `start_agent.ps1`, `restart_agent.ps1`, `watchdog.ps1`, `emergency_stop.ps1`, `update_agent.ps1` |
 
@@ -136,7 +137,7 @@ never counted as a win.
 ## Tests
 
 ```bash
-python -m pytest tests/ -v      # 264 tests, fully offline — no API keys or network required
+python -m pytest tests/ -v      # 276 tests, fully offline — no API keys or network required
 ```
 
 Every external integration (Tradovate, TradersPost, Claude) is exercised
@@ -177,6 +178,15 @@ end-to-end without touching the network (see `tests/test_main.py`).
    unconfirmed placeholder.** Read that module's docstring and confirm
    every threshold against Lucid's actual published rules before this is
    trusted with a real evaluation fee.
+
+7. **External alerting (optional)** — `notifications/alerts.py`, off unless
+   `ALERT_WEBHOOK_URL` is set. Posts a kill-switch trip (generic or Lucid),
+   an execution failure, an unhandled per-cycle crash, and process
+   start/stop to a generic webhook (Slack- and Discord-compatible
+   `{"text": ...}` payload) so an unattended run surfaces problems
+   immediately instead of only in a log file nobody's watching. A delivery
+   failure here is always swallowed — it never takes down the trading loop
+   that triggered it.
 
 > Research and paper-trading scaffold. Not financial advice. Confirm
 > `TRADOVATE_ENV=demo` and test thoroughly before ever pointing this at a

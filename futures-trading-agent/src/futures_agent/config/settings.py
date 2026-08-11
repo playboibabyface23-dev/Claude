@@ -173,6 +173,10 @@ class Settings:
     risk: RiskLimits = field(default_factory=RiskLimits)
     lucid: LucidEvalSettings = field(default_factory=LucidEvalSettings)
     kill_switch_file: str = "logs/KILL_SWITCH"
+    # Generic webhook (Slack/Discord-compatible {"text": ...} payload) for
+    # kill-switch trips, execution failures, and crashes. Empty = no alerts
+    # sent, only logged locally. See notifications/alerts.py.
+    alert_webhook_url: str = ""
 
     database_path: str = "database/futures_agent.db"
 
@@ -200,6 +204,7 @@ class Settings:
             risk=RiskLimits.from_env(),
             lucid=LucidEvalSettings.from_env(),
             kill_switch_file=_env_str("KILL_SWITCH_FILE", cls.kill_switch_file),
+            alert_webhook_url=_env_str("ALERT_WEBHOOK_URL", cls.alert_webhook_url),
             database_path=_env_str("DATABASE_PATH", cls.database_path),
             dashboard_host=_env_str("DASHBOARD_HOST", cls.dashboard_host),
             dashboard_port=_env_int("DASHBOARD_PORT", cls.dashboard_port),
