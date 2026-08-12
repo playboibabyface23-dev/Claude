@@ -196,3 +196,142 @@ def test_data_persists_across_reopening_the_same_file(tmp_path):
     assert db2.has_trade("t1")
     assert db2.high_water_mark() == 50_000.0
     db2.close()
+
+
+# --------------------------------------------------------------- multi-account
+
+def test_trades_default_to_the_default_account(db):
+    insert_trade(db, "t1")
+    trades = db.recent_trades(limit=1)
+    assert trades[0]["account"] == "default"
+
+
+def test_trades_are_scoped_per_account(db):
+    insert_trade(db, "t1", account="acct_a")
+    insert_trade(db, "t2", account="acct_b")
+    assert [t["identifier"] for t in db.recent_trades(account="acct_a")] == ["t1"]
+    assert [t["identifier"] for t in db.recent_trades(account="acct_b")] == ["t2"]
+    assert len(db.recent_trades()) == 2   # unfiltered aggregates across accounts
+
+
+def test_open_positions_count_is_scoped_per_account(db):
+    insert_trade(db, "t1", account="acct_a")
+    insert_trade(db, "t2", account="acct_b")
+    insert_trade(db, "t3", account="acct_b")
+    assert db.open_positions_count(account="acct_a") == 1
+    assert db.open_positions_count(account="acct_b") == 2
+    assert db.open_positions_count() == 3
+
+
+def test_trades_today_and_daily_pnl_are_scoped_per_account(db):
+    insert_trade(db, "t1", account="acct_a")
+    insert_trade(db, "t2", account="acct_b")
+    db.close_trade("t1", exit_price=20050.0, pnl=100.0)
+    db.close_trade("t2", exit_price=19950.0, pnl=-40.0)
+    assert db.trades_today(account="acct_a") == 1
+    assert db.trades_today(account="acct_b") == 1
+    assert db.daily_pnl(account="acct_a") == pytest.approx(100.0)
+    assert db.daily_pnl(account="acct_b") == pytest.approx(-40.0)
+    assert db.daily_pnl() == pytest.approx(60.0)
+
+
+def test_stats_are_scoped_per_account(db):
+    insert_trade(db, "t1", account="acct_a")
+    insert_trade(db, "t2", account="acct_b")
+    db.close_trade("t1", exit_price=20050.0, pnl=100.0)
+    stats_a = db.stats(account="acct_a")
+    stats_b = db.stats(account="acct_b")
+    assert stats_a["closed_trades"] == 1
+    assert stats_a["total_pnl"] == pytest.approx(100.0)
+    assert stats_b["closed_trades"] == 0
+    assert stats_b["open_trades"] == 1
+
+
+def test_rejections_are_scoped_per_account(db):
+    db.record_rejection(symbol="MNQ", reason="confidence", account="acct_a")
+    db.record_rejection(symbol="ES", reason="kill_switch", account="acct_b")
+    assert [r["reason"] for r in db.recent_rejections(account="acct_a")] == ["confidence"]
+    assert len(db.recent_rejections()) == 2
+
+
+def test_high_water_mark_is_independent_per_account(db):
+    db.update_high_water_mark(50_000.0, account="acct_a")
+    db.update_high_water_mark(80_000.0, account="acct_b")
+    assert db.high_water_mark(account="acct_a") == 50_000.0
+    assert db.high_water_mark(account="acct_b") == 80_000.0
+    assert db.high_water_mark() == 0.0   # 'default' account untouched
+
+
+def test_daily_equity_is_independent_per_account(db):
+    db.record_daily_equity("2026-08-10", 50_000.0, account="acct_a")
+    db.record_daily_equity("2026-08-10", 80_000.0, account="acct_b")
+    history_a = db.daily_equity_history(account="acct_a")
+    history_b = db.daily_equity_history(account="acct_b")
+    assert len(history_a) == 1 and history_a[0]["equity"] == 50_000.0
+    assert len(history_b) == 1 and history_b[0]["equity"] == 80_000.0
+    assert len(db.daily_equity_history(account=None)) == 2
+
+
+def test_realized_pnl_by_day_is_scoped_per_account(db):
+    insert_trade(db, "t1", account="acct_a")
+    insert_trade(db, "t2", account="acct_b")
+    db.close_trade("t1", exit_price=20050.0, pnl=100.0)
+    db.close_trade("t2", exit_price=19950.0, pnl=-40.0)
+    today = datetime.now(timezone.utc).date().isoformat()
+    assert db.realized_pnl_by_day(account="acct_a")[today] == pytest.approx(100.0)
+    assert db.realized_pnl_by_day(account="acct_b")[today] == pytest.approx(-40.0)
+    assert db.realized_pnl_by_day()[today] == pytest.approx(60.0)
+
+
+def test_legacy_single_account_database_migrates_in_place(tmp_path):
+    """A database created before multi-account support (no `account` column
+    on trades/rejections, `daily_equity` keyed by `date` alone) must open
+    cleanly and behave as if every existing row belongs to 'default'."""
+    path = str(tmp_path / "legacy.db")
+    conn = sqlite3.connect(path)
+    conn.executescript("""
+        CREATE TABLE trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            identifier TEXT UNIQUE NOT NULL,
+            symbol TEXT NOT NULL,
+            action TEXT NOT NULL,
+            contracts INTEGER NOT NULL,
+            entry_price REAL, stop_price REAL, target_price REAL,
+            exit_price REAL, pnl REAL,
+            status TEXT NOT NULL DEFAULT 'open',
+            ai_confidence REAL, ai_reasoning TEXT,
+            opened_at TEXT NOT NULL, closed_at TEXT
+        );
+        CREATE TABLE rejections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT, reason TEXT NOT NULL, detail TEXT, created_at TEXT NOT NULL
+        );
+        CREATE TABLE kv (key TEXT PRIMARY KEY, value REAL NOT NULL);
+        CREATE TABLE daily_equity (
+            date TEXT PRIMARY KEY, equity REAL NOT NULL, recorded_at TEXT NOT NULL
+        );
+        INSERT INTO trades (identifier, symbol, action, contracts, status, opened_at)
+            VALUES ('legacy-1', 'MNQ', 'BUY', 1, 'open', '2026-08-10T00:00:00+00:00');
+        INSERT INTO rejections (symbol, reason, detail, created_at)
+            VALUES ('MNQ', 'confidence', 'too low', '2026-08-10T00:00:00+00:00');
+        INSERT INTO kv (key, value) VALUES ('high_water_mark', 55000.0);
+        INSERT INTO daily_equity (date, equity, recorded_at)
+            VALUES ('2026-08-10', 55000.0, '2026-08-10T00:00:00+00:00');
+    """)
+    conn.commit()
+    conn.close()
+
+    db = Database(path)
+    try:
+        assert db.has_trade("legacy-1")
+        assert db.recent_trades(account="default")[0]["identifier"] == "legacy-1"
+        assert db.recent_rejections(account="default")[0]["reason"] == "confidence"
+        assert db.high_water_mark() == 55_000.0
+        history = db.daily_equity_history(account="default")
+        assert len(history) == 1 and history[0]["equity"] == 55_000.0
+        # New writes with the same date/account must upsert cleanly on the
+        # rebuilt composite primary key, not collide with the migrated row.
+        db.record_daily_equity("2026-08-10", 60_000.0, account="default")
+        assert db.daily_equity_history(account="default")[0]["equity"] == 60_000.0
+    finally:
+        db.close()

@@ -35,8 +35,8 @@ Market data → Indicators → Claude decision engine → Risk manager → Execu
 | `strategies/` | Deterministic reference strategy (confluence counting) used **only** by the backtester as a stand-in for Claude |
 | `risk/` | Hard-capped risk manager: confidence floor, daily loss, trades/day, drawdown, open positions, position sizing, kill switch — plus an optional Lucid/prop-firm eval guard (EOD trailing drawdown, consistency rule) |
 | `execution/` | Tradovate order placement and the TradersPost webhook client, validated and duplicate-safe; `main.py` reconciles closed positions back into the database (see below) |
-| `database/` | SQLite: trades, AI decision log, rejections, high-water mark, daily equity |
-| `dashboard/` | stdlib HTTP dashboard: positions, balance, P&L, win rate, confidence history, trade history |
+| `database/` | SQLite: trades, AI decision log, rejections, high-water mark, daily equity — all scoped per trading account (see Multi-account trading below) |
+| `dashboard/` | stdlib HTTP dashboard: positions, balance, P&L, win rate, confidence history, trade history, per-account breakdown |
 | `notifications/` | External alerting (generic Slack/Discord-compatible webhook) for kill-switch trips, execution failures, and crashes — off unless `ALERT_WEBHOOK_URL` is set |
 | `backtesting/` | Replays history through the real risk manager and position management |
 | `powershell/` | `start_agent.ps1`, `restart_agent.ps1`, `watchdog.ps1`, `emergency_stop.ps1`, `update_agent.ps1` |
@@ -87,6 +87,45 @@ follow Tradovate's long-stable list/item/find/placeorder conventions and are
 covered by tests, but were not separately re-verified live in this session;
 run `TradovateClient.check_connection()` against demo before trusting them
 with a real account.
+
+## Multi-account trading
+
+The agent can trade N broker accounts at once from one process. One shared
+market-data feed and one shared Claude decision per symbol per cycle are
+fanned out to every configured account — each gets its own `RiskManager`,
+its own `ExecutionEngine`, its own broker client(s), its own kill-switch
+file, and its own optional Lucid eval guard, so sizing, risk gating, and
+order placement are fully independent per account. **Claude never sees or
+picks an account — only a symbol** — the same "Claude never sends orders"
+invariant from the top of this file applies per account, not just once.
+
+Configure it with indexed `ACCOUNT_1_*`, `ACCOUNT_2_*`, ... env vars (see
+`.env.example` for the full field list per account — execution mode,
+Tradovate/TradersPost credentials, risk limits, Lucid settings). Indexes
+can be sparse, up to 20 accounts. **Leave every `ACCOUNT_N_*` var unset to
+keep the single legacy account** built from the existing top-level fields
+(`TRADOVATE_*`, `EXECUTION_MODE`, `ACCOUNT_EQUITY`, ...) — an existing
+single-account `.env` file needs no changes.
+
+Every trade, rejection, and equity snapshot in the database is tagged with
+the account name that produced it (`database/db.py`'s `account` column),
+so daily-loss limits, trades-per-day caps, drawdown, and open-position
+counts are all counted per account, never pooled across accounts. A
+database created before multi-account support existed is migrated in
+place the first time it's opened — every pre-existing row is treated as
+belonging to the `default` account, with no data loss and no separate
+migration step to run by hand. The dashboard's `Accounts` section (see
+below) shows the live per-account breakdown alongside the existing
+aggregate tiles.
+
+**Position reconciliation is per account too** (see below): each
+account's open trades are checked only against that same account's own
+broker connection, never against a different account's. An account with
+Tradovate credentials configured reconciles normally; a TradersPost-only
+account (no Tradovate credentials at all) has no broker-side read API and
+is skipped for that account specifically — the same limitation the
+single-account path has always had, just scoped per account instead of
+globally.
 
 ## Setup
 
@@ -178,7 +217,7 @@ this in production.
 ## Tests
 
 ```bash
-python -m pytest tests/ -v      # 293 tests, fully offline — no API keys or network required
+python -m pytest tests/ -v      # 317 tests, fully offline — no API keys or network required
 ```
 
 Every external integration (Tradovate, TradersPost, Claude) is exercised

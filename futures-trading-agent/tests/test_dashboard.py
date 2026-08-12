@@ -66,6 +66,24 @@ def test_snapshot_includes_confidence_history_and_rejections(db):
     assert len(snap["recent_rejections"]) == 1
 
 
+def test_snapshot_accounts_defaults_to_empty_list(db):
+    snap = build_snapshot(db, clean_account())
+    assert snap["accounts"] == []
+
+
+def test_snapshot_includes_per_account_breakdown(db):
+    breakdown = [
+        {"name": "default", "equity": 50_000.0, "high_water_mark": 50_000.0,
+         "daily_pnl": 0.0, "trades_today": 0, "open_positions": 0, "kill_switch_active": False},
+        {"name": "second", "equity": 100_000.0, "high_water_mark": 100_000.0,
+         "daily_pnl": -50.0, "trades_today": 1, "open_positions": 1, "kill_switch_active": True},
+    ]
+    snap = build_snapshot(db, clean_account(), accounts=breakdown)
+    assert snap["accounts"] == breakdown
+    # The aggregate "account" tile must stay independent of the breakdown.
+    assert snap["account"]["equity"] == 50_000.0
+
+
 def test_snapshot_is_json_serializable(db):
     db.record_trade(identifier="t1", symbol="MNQ", action="BUY", contracts=1)
     snap = build_snapshot(db, clean_account())

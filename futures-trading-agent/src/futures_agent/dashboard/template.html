@@ -69,6 +69,11 @@
   <div class="tiles" id="tiles"></div>
 
   <section>
+    <h2>Accounts</h2>
+    <div id="accounts"></div>
+  </section>
+
+  <section>
     <h2>Open Positions</h2>
     <div id="positions"></div>
   </section>
@@ -120,9 +125,24 @@ el("tiles").innerHTML = [
   ["Total P&L", money(stats.total_pnl), stats.total_pnl > 0 ? "pos" : stats.total_pnl < 0 ? "neg" : ""],
 ].map(([k, v, cls]) => `<div class="tile"><div class="k">${k}</div><div class="v ${cls}">${v}</div></div>`).join("");
 
+el("accounts").innerHTML = table(
+  ["Account", "Equity", "High-Water Mark", "Today's P&L", "Trades Today", "Open Positions", "Kill Switch"],
+  (S.accounts || []).map(a => `<tr>
+    <td>${esc(a.name)}</td>
+    <td class="mono">${money(a.equity)}</td>
+    <td class="mono">${money(a.high_water_mark)}</td>
+    <td class="mono">${money(a.daily_pnl)}</td>
+    <td>${a.trades_today}</td>
+    <td>${a.open_positions}</td>
+    <td>${a.kill_switch_active
+      ? '<span class="pill p-fail">active</span>' : '<span class="pill p-pass">clear</span>'}</td>
+  </tr>`)
+);
+
 el("positions").innerHTML = table(
-  ["Symbol", "Action", "Contracts", "Entry", "Stop", "Target", "Opened"],
+  ["Account", "Symbol", "Action", "Contracts", "Entry", "Stop", "Target", "Opened"],
   (S.positions || []).map(p => `<tr>
+    <td>${esc(p.account || "default")}</td>
     <td>${esc(p.symbol)}</td><td>${esc(p.action)}</td><td>${p.contracts}</td>
     <td class="mono">${p.entry_price ?? "—"}</td><td class="mono">${p.stop_price ?? "—"}</td>
     <td class="mono">${p.target_price ?? "—"}</td>
@@ -142,8 +162,9 @@ el("confidence").innerHTML = table(
 );
 
 el("trades").innerHTML = table(
-  ["Symbol", "Action", "Contracts", "Entry", "Exit", "P&L", "Status", "Opened", "Closed"],
+  ["Account", "Symbol", "Action", "Contracts", "Entry", "Exit", "P&L", "Status", "Opened", "Closed"],
   (S.recent_trades || []).map(t => `<tr>
+    <td>${esc(t.account || "default")}</td>
     <td>${esc(t.symbol)}</td><td>${esc(t.action)}</td><td>${t.contracts}</td>
     <td class="mono">${t.entry_price ?? "—"}</td><td class="mono">${t.exit_price ?? "—"}</td>
     <td class="mono ${t.pnl > 0 ? "" : t.pnl < 0 ? "" : ""}">${t.pnl != null ? money(t.pnl) : "—"}</td>
@@ -154,8 +175,9 @@ el("trades").innerHTML = table(
 );
 
 el("rejections").innerHTML = table(
-  ["Symbol", "Reason", "Detail", "At"],
+  ["Account", "Symbol", "Reason", "Detail", "At"],
   (S.recent_rejections || []).map(r => `<tr>
+    <td>${esc(r.account || "default")}</td>
     <td>${esc(r.symbol || "—")}</td><td>${esc(r.reason)}</td>
     <td>${esc(r.detail || "")}</td>
     <td>${new Date(r.created_at).toLocaleString()}</td>

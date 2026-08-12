@@ -31,7 +31,7 @@ def make_candles(bars: list[tuple[float, float, float, float]],
 def tmp_env(tmp_path, monkeypatch):
     """Isolate settings from the real environment/.env for a single test."""
     for key in list(__import__("os").environ):
-        if key.startswith(("TRADOVATE_", "ANTHROPIC_", "TRADERSPOST_")):
+        if key.startswith(("TRADOVATE_", "ANTHROPIC_", "TRADERSPOST_", "ACCOUNT_")):
             monkeypatch.delenv(key, raising=False)
     monkeypatch.chdir(tmp_path)
     return tmp_path

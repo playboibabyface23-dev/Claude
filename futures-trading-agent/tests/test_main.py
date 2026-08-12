@@ -4,11 +4,12 @@ offline."""
 
 import asyncio
 import json
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from futures_agent.config.settings import LucidEvalSettings, RiskLimits, Settings
+from futures_agent.config.settings import AccountConfig, LucidEvalSettings, RiskLimits, Settings
 from futures_agent.main import Agent, MIN_BARS_TO_ANALYZE
 from futures_agent.market.models import Candle
 from futures_agent.notifications.alerts import AlertLevel
@@ -545,3 +546,115 @@ def test_close_closes_the_live_feed(tmp_path):
                  live_feed=live_feed)
     run(agent.close())
     assert live_feed.closed
+
+
+# --------------------------------------------------------------- multi-account
+
+def make_multi_account_settings(tmp_path, second_risk_kw=None):
+    settings = make_settings(tmp_path)
+    default_account = AccountConfig(
+        name="default", execution_mode="tradovate", risk=settings.risk, lucid=settings.lucid)
+    second_account = AccountConfig(
+        name="second", execution_mode="tradovate",
+        risk=RiskLimits(account_equity=100_000.0, risk_pct_per_trade=0.5, **(second_risk_kw or {})),
+    )
+    return replace(settings, accounts=(default_account, second_account))
+
+
+def patch_extra_tradovate(monkeypatch, fake: FakeTradovate):
+    import futures_agent.main as main_mod
+    monkeypatch.setattr(main_mod, "TradovateClient", lambda credentials: fake)
+
+
+def test_multi_account_agent_builds_one_runtime_per_account(tmp_path, monkeypatch):
+    extra_tv = FakeTradovate()
+    patch_extra_tradovate(monkeypatch, extra_tv)
+    settings = make_multi_account_settings(tmp_path)
+    primary_tv = FakeTradovate()
+    agent = Agent(settings, bars_provider=FakeBarsProvider(candles()),
+                 tradovate_client=primary_tv, ai_client=FakeAIClient(HOLD_PAYLOAD))
+
+    assert len(agent.accounts) == 2
+    assert [a.config.name for a in agent.accounts] == ["default", "second"]
+    assert agent.accounts[0].tradovate is primary_tv
+    assert agent.accounts[1].tradovate is extra_tv
+    assert agent.accounts[0].risk_manager is not agent.accounts[1].risk_manager
+    agent.db.close()
+
+
+def test_multi_account_fans_out_one_shared_decision_with_independent_sizing(tmp_path, monkeypatch):
+    extra_tv = FakeTradovate()
+    patch_extra_tradovate(monkeypatch, extra_tv)
+    settings = make_multi_account_settings(tmp_path)
+    primary_tv = FakeTradovate()
+    agent = Agent(settings, bars_provider=FakeBarsProvider(candles()),
+                 tradovate_client=primary_tv, ai_client=FakeAIClient(BUY_PAYLOAD))
+
+    run(agent.run_cycle("MNQ"))
+
+    # One shared AI decision recorded, not one per account.
+    assert len(agent.db.confidence_history()) == 1
+
+    assert len(primary_tv.calls) == 1
+    assert len(extra_tv.calls) == 1
+
+    default_trades = agent.db.recent_trades(account="default")
+    second_trades = agent.db.recent_trades(account="second")
+    assert len(default_trades) == 1
+    assert len(second_trades) == 1
+    # 50,000 equity @ 0.5% = $250 budget -> 6 contracts on a 20pt/$40 stop;
+    # 100,000 equity @ 0.5% = $500 budget -> 12 contracts. Same decision,
+    # independently sized per account.
+    assert default_trades[0]["contracts"] == 6
+    assert second_trades[0]["contracts"] == 12
+    agent.db.close()
+
+
+def test_multi_account_kill_switch_is_isolated_per_account(tmp_path, monkeypatch):
+    extra_tv = FakeTradovate()
+    patch_extra_tradovate(monkeypatch, extra_tv)
+    settings = make_multi_account_settings(tmp_path)
+    primary_tv = FakeTradovate()
+    agent = Agent(settings, bars_provider=FakeBarsProvider(candles()),
+                 tradovate_client=primary_tv, ai_client=FakeAIClient(BUY_PAYLOAD))
+
+    agent.accounts[1].risk_manager.trip_kill_switch("second account halted for testing")
+    run(agent.run_cycle("MNQ"))
+
+    # "default" still traded normally -- one account's kill switch must not
+    # block another account sharing the same process.
+    assert len(primary_tv.calls) == 1
+    assert len(extra_tv.calls) == 0
+
+    second_rejections = agent.db.recent_rejections(account="second")
+    assert second_rejections[0]["reason"] == "kill_switch"
+    assert agent.db.recent_trades(account="second") == []
+    agent.db.close()
+
+
+def test_multi_account_reconciliation_uses_each_accounts_own_position_client(tmp_path, monkeypatch):
+    extra_tv = FakeTradovate()
+    extra_tv.positions = []   # second account's broker shows flat
+    patch_extra_tradovate(monkeypatch, extra_tv)
+    settings = make_multi_account_settings(tmp_path)
+    primary_tv = FakeTradovate()
+    primary_tv.positions = [{"contractId": 1, "netPos": 2}]   # default account still holds it
+    agent = Agent(settings, bars_provider=FakeBarsProvider(candles()),
+                 tradovate_client=primary_tv, ai_client=FakeAIClient(HOLD_PAYLOAD))
+
+    agent.db.record_trade(identifier="d1", account="default", symbol="MNQ", action="BUY",
+                          contracts=2, entry_price=100.0)
+    agent.db.record_trade(identifier="s1", account="second", symbol="MNQ", action="BUY",
+                          contracts=1, entry_price=100.0)
+    agent.history["MNQ"] = [Candle(timestamp=datetime.now(UTC), open=105.0, high=106.0,
+                                   low=104.0, close=105.0, volume=10)]
+
+    run(agent.reconcile_positions())
+
+    # default's broker still shows the position open -- stays open.
+    assert agent.db.open_positions_count(account="default") == 1
+    # second's broker shows flat -- reconciled closed, tagged with its own account.
+    assert agent.db.open_positions_count(account="second") == 0
+    second_rejections = agent.db.recent_rejections(account="second")
+    assert second_rejections[0]["reason"] == "position_reconciled"
+    agent.db.close()
