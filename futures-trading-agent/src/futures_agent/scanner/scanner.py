@@ -93,9 +93,11 @@ class Scanner:
         self.last_scan: dict[str, ScanRecord] = {}
         self._last_alert_at: dict[str, datetime] = {}
         self._running = True
+        self._stop_event = asyncio.Event()
 
     def stop(self) -> None:
         self._running = False
+        self._stop_event.set()
 
     async def close(self) -> None:
         await self.notifier.close()
@@ -161,8 +163,13 @@ class Scanner:
         return last is None or (now - last) >= cooldown
 
     async def run_once(self) -> list[ScanDecision]:
-        news = await self.news_client.general_news(limit=self.settings.scan_news_limit)
-        minutes_to_event = await self.news_client.minutes_to_next_high_impact_event()
+        # Two independent Finnhub endpoints, no data dependency between
+        # them -- fetch concurrently so the cycle pays the slower of the
+        # two round-trips rather than the sum of both.
+        news, minutes_to_event = await asyncio.gather(
+            self.news_client.general_news(limit=self.settings.scan_news_limit),
+            self.news_client.minutes_to_next_high_impact_event(),
+        )
 
         results: list[ScanDecision] = []
         now = datetime.now(timezone.utc)
@@ -212,7 +219,16 @@ class Scanner:
 
             if not self._running:
                 break
-            await asyncio.sleep(self.settings.scan_poll_interval_seconds)
+            # wait_for + an Event (set by stop()) rather than a plain sleep,
+            # so SIGINT/SIGTERM during the wait shuts down immediately
+            # instead of stalling for up to scan_poll_interval_seconds
+            # (5 minutes by default -- far longer than main.py's Agent loop
+            # ever waits between cycles).
+            try:
+                await asyncio.wait_for(
+                    self._stop_event.wait(), timeout=self.settings.scan_poll_interval_seconds)
+            except asyncio.TimeoutError:
+                pass
 
         log_restart("scanner_shutdown")
         if self.notifier.enabled:

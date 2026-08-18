@@ -76,12 +76,16 @@ class FinnhubNewsClient:
             resp = await self._client.get("/news", params={"category": "general"})
             resp.raise_for_status()
             rows = resp.json()
+            if not isinstance(rows, list):
+                raise ValueError(f"expected a JSON array, got {type(rows).__name__}")
         except Exception as exc:
             log.warning("could not fetch market news: %s", exc)
             return []
 
         out: list[NewsHeadline] = []
-        for row in (rows or [])[:limit]:
+        for row in rows[:limit]:
+            if not isinstance(row, dict):
+                continue
             try:
                 published = datetime.fromtimestamp(int(row.get("datetime")), tz=timezone.utc)
             except (TypeError, ValueError):
@@ -95,11 +99,15 @@ class FinnhubNewsClient:
             ))
         return out
 
-    async def economic_calendar(self, hours_ahead: float = 24.0) -> list[EconomicEvent]:
-        """High-impact events from now through `hours_ahead` (a small window
-        behind "now" is included too, on the same reasoning as
-        trading_system.news: the minutes right after a release are as
-        dangerous as the minutes before)."""
+    async def economic_calendar(self, hours_ahead: float = 24.0,
+                                lookback_minutes: float = 5.0) -> list[EconomicEvent]:
+        """High-impact events from `lookback_minutes` in the past through
+        `hours_ahead` in the future (a small window behind "now" is included
+        too, on the same reasoning as trading_system.news: the minutes right
+        after a release are as dangerous as the minutes before). Finnhub's
+        `/calendar/economic` is date-scoped rather than time-scoped, so this
+        also filters the response down to the actual requested window
+        instead of just trusting the API to have done so."""
         if not self.enabled:
             return []
         now = datetime.now(timezone.utc)
@@ -110,14 +118,15 @@ class FinnhubNewsClient:
                 params={"from": now.date().isoformat(), "to": end.date().isoformat()},
             )
             resp.raise_for_status()
-            rows = resp.json().get("economicCalendar") or []
+            body = resp.json()
+            rows = body.get("economicCalendar") or [] if isinstance(body, dict) else []
         except Exception as exc:
             log.warning("could not fetch economic calendar: %s", exc)
             return []
 
         out: list[EconomicEvent] = []
         for row in rows:
-            if str(row.get("impact", "")).lower() != "high":
+            if not isinstance(row, dict) or str(row.get("impact", "")).lower() != "high":
                 continue
             raw_time = row.get("time")
             if not raw_time:
@@ -127,6 +136,11 @@ class FinnhubNewsClient:
                 when = datetime.strptime(text[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
             except ValueError:
                 log.debug("unparseable economic calendar time: %r", raw_time)
+                continue
+            # The Finnhub query above is date-scoped, not time-scoped, so it
+            # can return events up to ~1 day beyond `end` -- enforce the
+            # actual hours_ahead window here rather than just documenting it.
+            if not (now - timedelta(minutes=lookback_minutes) <= when <= end):
                 continue
             out.append(EconomicEvent(
                 event=str(row.get("event", "")),
@@ -144,7 +158,8 @@ class FinnhubNewsClient:
         relevant is in view. Every futures symbol this project trades
         (MNQ/NQ/MES/ES/GC -- see config/symbols.py) is a US-listed
         index/metal contract, so "relevant" defaults to US releases only."""
-        events = await self.economic_calendar(hours_ahead=hours_ahead)
+        events = await self.economic_calendar(hours_ahead=hours_ahead,
+                                              lookback_minutes=lookback_minutes)
         now = datetime.now(timezone.utc)
         best: Optional[float] = None
         for ev in events:

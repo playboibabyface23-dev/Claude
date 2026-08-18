@@ -6,6 +6,7 @@ effect is a notification."""
 
 import asyncio
 import json
+import time
 from datetime import datetime, timedelta, timezone
 
 from futures_agent.config.settings import Settings
@@ -236,6 +237,31 @@ def test_news_and_event_context_reach_the_decision_engine():
 
 
 # --------------------------------------------------------------- one bad symbol doesn't kill the scan
+
+def test_stop_wakes_run_forever_immediately_instead_of_waiting_out_the_poll_interval():
+    # scan_poll_interval_seconds is deliberately huge here -- if stop()
+    # merely flipped a flag checked after a plain asyncio.sleep(), this
+    # test would need to actually wait out that interval to pass.
+    settings = Settings(anthropic_api_key="test-key", scan_symbols=("MNQ",),
+                        scan_poll_interval_seconds=3600)
+    scanner = Scanner(
+        settings, bars_provider=FakeBarsProvider(candles()),
+        ai_client=FakeAIClient(HOLD_DECISION), news_client=FakeNewsClient(),
+        notifier=RecordingNotifier(),
+    )
+
+    async def stop_soon():
+        await asyncio.sleep(0.05)
+        scanner.stop()
+
+    async def scenario():
+        await asyncio.gather(scanner.run_forever(), stop_soon())
+
+    started = time.monotonic()
+    run(scenario())
+    elapsed = time.monotonic() - started
+    assert elapsed < 2.0   # far below the 3600s poll interval
+
 
 def test_a_symbol_that_raises_does_not_stop_the_rest_of_the_scan():
     settings = Settings(anthropic_api_key="test-key", scan_symbols=("MNQ", "GC"))

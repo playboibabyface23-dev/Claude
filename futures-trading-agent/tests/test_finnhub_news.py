@@ -95,6 +95,34 @@ def test_general_news_skips_rows_with_unparseable_datetime():
     run(c.close())
 
 
+def test_general_news_fails_quiet_on_a_malformed_200_body():
+    # A 200 response whose body isn't the documented array (e.g. an error
+    # surfaced as {"error": "..."} instead of a 4xx status) must degrade to
+    # an empty list, not raise out of general_news() and abort the scan.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"error": "rate limit exceeded"})
+
+    c = client_with(handler)
+    assert run(c.general_news()) == []
+    run(c.close())
+
+
+def test_general_news_skips_non_dict_rows():
+    now = int(datetime.now(UTC).timestamp())
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[
+            "not a row",
+            {"headline": "valid row", "summary": "", "source": "x", "datetime": now},
+        ])
+
+    c = client_with(handler)
+    headlines = run(c.general_news())
+    assert len(headlines) == 1
+    assert headlines[0].headline == "valid row"
+    run(c.close())
+
+
 def test_general_news_swallows_http_errors():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(500, text="upstream error")
@@ -116,10 +144,12 @@ def test_general_news_swallows_connection_errors():
 # --------------------------------------------------------------- economic_calendar
 
 def test_economic_calendar_keeps_only_high_impact_rows():
+    soon = (datetime.now(UTC) + timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
+
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"economicCalendar": [
-            {"event": "CPI", "country": "US", "time": "2026-08-19 12:30:00", "impact": "high"},
-            {"event": "Minor release", "country": "US", "time": "2026-08-19 12:30:00", "impact": "low"},
+            {"event": "CPI", "country": "US", "time": soon, "impact": "high"},
+            {"event": "Minor release", "country": "US", "time": soon, "impact": "low"},
         ]})
 
     c = client_with(handler)
@@ -127,6 +157,22 @@ def test_economic_calendar_keeps_only_high_impact_rows():
     assert len(events) == 1
     assert events[0].event == "CPI"
     assert events[0].impact == "high"
+    run(c.close())
+
+
+def test_economic_calendar_filters_out_events_beyond_hours_ahead():
+    # Finnhub's calendar endpoint is date-scoped, not time-scoped, so it can
+    # legitimately return an event past the requested window; the client
+    # must filter it out itself rather than trusting the API's date filter.
+    too_far = (datetime.now(UTC) + timedelta(hours=30)).strftime("%Y-%m-%d %H:%M:%S")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"economicCalendar": [
+            {"event": "Next week's CPI", "country": "US", "time": too_far, "impact": "high"},
+        ]})
+
+    c = client_with(handler)
+    assert run(c.economic_calendar(hours_ahead=24.0)) == []
     run(c.close())
 
 
