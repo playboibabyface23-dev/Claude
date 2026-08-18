@@ -76,6 +76,11 @@ class RiskLimits:
     max_drawdown_pct: float = 8.0        # from equity high-water mark
     max_open_positions: int = 1
     min_ai_confidence: float = 65.0      # 0-100, reject decisions below this
+    # Hard ceiling on contracts in a single position, independent of the
+    # risk_pct_per_trade math -- a broker/prop-firm position-size limit
+    # (e.g. a funded account capped at 5 contracts) that a tight stop could
+    # otherwise blow straight through. 0 = no cap.
+    max_contracts_per_position: int = 0
 
     @classmethod
     def from_env(cls, prefix: str = "") -> "RiskLimits":
@@ -87,6 +92,9 @@ class RiskLimits:
             max_drawdown_pct=_env_float(f"{prefix}MAX_DRAWDOWN_PCT", cls.max_drawdown_pct),
             max_open_positions=_env_int(f"{prefix}MAX_OPEN_POSITIONS", cls.max_open_positions),
             min_ai_confidence=_env_float(f"{prefix}MIN_AI_CONFIDENCE", cls.min_ai_confidence),
+            max_contracts_per_position=_env_int(
+                f"{prefix}MAX_CONTRACTS_PER_POSITION", cls.max_contracts_per_position
+            ),
         )
 
 

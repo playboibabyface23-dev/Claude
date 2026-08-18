@@ -57,6 +57,24 @@ def test_position_size_zero_when_stop_too_wide_for_budget(tmp_path):
     assert m.position_size(MNQ, stop_loss_points=20.0) == 0
 
 
+def test_position_size_respects_max_contracts_cap(tmp_path):
+    # A tight 2pt stop on MNQ ($4/contract) against a $250 budget sizes to
+    # 62 contracts uncapped -- a broker/prop-firm 5-contract limit must win.
+    m = manager(tmp_path, max_contracts_per_position=5)
+    assert m.position_size(MNQ, stop_loss_points=2.0) == 5
+
+
+def test_position_size_cap_does_not_raise_a_smaller_size(tmp_path):
+    # The cap only ever lowers the risk-budget size, never raises it.
+    m = manager(tmp_path, max_contracts_per_position=5)
+    assert m.position_size(MNQ, stop_loss_points=30.0) == 4
+
+
+def test_position_size_cap_of_zero_means_uncapped(tmp_path):
+    m = manager(tmp_path, max_contracts_per_position=0)
+    assert m.position_size(MNQ, stop_loss_points=2.0) == 62
+
+
 # --------------------------------------------------------------- kill switch
 
 def test_kill_switch_inactive_by_default(tmp_path):

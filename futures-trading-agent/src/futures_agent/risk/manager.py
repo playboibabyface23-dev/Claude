@@ -107,14 +107,20 @@ class RiskManager:
     def position_size(self, symbol: FuturesSymbol, stop_loss_points: float) -> int:
         """Whole contracts affordable within `risk_pct_per_trade` of the
         configured account equity, given a stop distance in points.
-        Rounds down — never up, never to a fraction of a contract."""
+        Rounds down — never up, never to a fraction of a contract. Capped
+        at `max_contracts_per_position` when set (a broker/prop-firm
+        position-size limit that a tight stop could otherwise blow through
+        regardless of the risk-budget math)."""
         if stop_loss_points <= 0:
             return 0
         risk_dollars = self.limits.account_equity * self.limits.risk_pct_per_trade / 100
         dollar_risk_per_contract = stop_loss_points * symbol.multiplier
         if dollar_risk_per_contract <= 0:
             return 0
-        return max(int(risk_dollars // dollar_risk_per_contract), 0)
+        contracts = max(int(risk_dollars // dollar_risk_per_contract), 0)
+        if self.limits.max_contracts_per_position > 0:
+            contracts = min(contracts, self.limits.max_contracts_per_position)
+        return contracts
 
     # ------------------------------------------------------------ full checklist
 
