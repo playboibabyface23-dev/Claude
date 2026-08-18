@@ -1,0 +1,26 @@
+[project]
+name = "futures-trading-agent"
+version = "0.1.0"
+description = "Autonomous futures trading agent: Tradovate/TradersPost execution, Claude decision engine, deterministic risk manager"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.120",
+    "httpx>=0.27",
+    "pydantic>=2.7",
+    "python-dotenv>=1.0",
+    "websockets>=12.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

@@ -1,0 +1,47 @@
+name: futures-trading-agent tests
+
+on:
+  push:
+    paths:
+      - 'futures-trading-agent/**'
+      - '.github/workflows/futures-trading-agent-tests.yml'
+  pull_request:
+    paths:
+      - 'futures-trading-agent/**'
+      - '.github/workflows/futures-trading-agent-tests.yml'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12']
+    defaults:
+      run:
+        working-directory: futures-trading-agent
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      - name: Run tests
+        # The suite is deliberately offline — no API keys, no network. If a
+        # test ever needs either, that is the bug.
+        run: python -m pytest tests/ -v
+
+      - name: Verify no credentials are required
+        env:
+          ANTHROPIC_API_KEY: ''
+          TRADOVATE_USERNAME: ''
+          TRADOVATE_PASSWORD: ''
+          TRADOVATE_CID: ''
+          TRADOVATE_SEC: ''
+          TRADERSPOST_WEBHOOK_URL: ''
+        run: python -m pytest tests/ -q

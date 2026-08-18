@@ -1,0 +1,47 @@
+name: trading-system tests
+
+on:
+  push:
+    paths:
+      - 'trading-system/**'
+      - '.github/workflows/trading-system-tests.yml'
+  pull_request:
+    paths:
+      - 'trading-system/**'
+      - '.github/workflows/trading-system-tests.yml'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12']
+    defaults:
+      run:
+        working-directory: trading-system
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      - name: Run tests
+        # The suite is deliberately offline — no API keys, no network. If a
+        # test ever needs either, that is the bug.
+        run: python -m pytest tests/ -v
+
+      - name: Verify no credentials are required
+        env:
+          ANTHROPIC_API_KEY: ''
+          POLYGON_API_KEY: ''
+          ALPACA_API_KEY_ID: ''
+          ALPACA_API_SECRET_KEY: ''
+          FINNHUB_API_KEY: ''
+          TRADERSPOST_WEBHOOK_URL: ''
+        run: python -m pytest tests/ -q
