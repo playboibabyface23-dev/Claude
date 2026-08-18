@@ -273,6 +273,35 @@ class Settings:
     # sent, only logged locally. See notifications/alerts.py.
     alert_webhook_url: str = ""
 
+    # --- Scanner (scanner/) -- advisory only, never places an order ---
+    # Finnhub API key for market headlines and the high-impact economic
+    # calendar. Empty = the scanner still runs on price action alone (see
+    # news/finnhub_news.py's fail-quiet posture).
+    finnhub_api_key: str = ""
+    # Symbols the scanner scans. Empty = every symbol in
+    # config/symbols.SYMBOL_CATALOG ("scan everything"), independent of
+    # traded_symbols above.
+    scan_symbols: tuple[str, ...] = ()
+    # Minimum confidence (0-100) before a scan result becomes a
+    # notification. Below this it's still logged, just not alerted.
+    scan_min_confidence: float = 70.0
+    # How often the scanner re-scans every symbol, in seconds. Deliberately
+    # much slower than poll_interval_seconds above -- one scan cycle is one
+    # news fetch plus one Claude call per symbol, and there's no order to
+    # place in a hurry.
+    scan_poll_interval_seconds: int = 300
+    # Minimum minutes between two alerts for the same symbol, so a
+    # persistent setup doesn't re-notify every single cycle.
+    scan_alert_cooldown_minutes: int = 60
+    # Max headlines pulled per scan cycle.
+    scan_news_limit: int = 15
+    # Webhook the scanner posts trade-worth-a-look alerts to (same
+    # Slack/Discord-compatible {"text": ...} format as alert_webhook_url).
+    # Empty = falls back to alert_webhook_url, so a single webhook covers
+    # both operational alerts and scan notifications unless you want them
+    # split into separate channels.
+    scan_alert_webhook_url: str = ""
+
     database_path: str = "database/futures_agent.db"
 
     dashboard_host: str = "127.0.0.1"
@@ -314,6 +343,17 @@ class Settings:
             ),
             kill_switch_file=_env_str("KILL_SWITCH_FILE", cls.kill_switch_file),
             alert_webhook_url=_env_str("ALERT_WEBHOOK_URL", cls.alert_webhook_url),
+            finnhub_api_key=_env_str("FINNHUB_API_KEY", cls.finnhub_api_key),
+            scan_symbols=_env_list("SCAN_SYMBOLS", cls.scan_symbols),
+            scan_min_confidence=_env_float("SCAN_MIN_CONFIDENCE", cls.scan_min_confidence),
+            scan_poll_interval_seconds=_env_int(
+                "SCAN_POLL_INTERVAL_SECONDS", cls.scan_poll_interval_seconds
+            ),
+            scan_alert_cooldown_minutes=_env_int(
+                "SCAN_ALERT_COOLDOWN_MINUTES", cls.scan_alert_cooldown_minutes
+            ),
+            scan_news_limit=_env_int("SCAN_NEWS_LIMIT", cls.scan_news_limit),
+            scan_alert_webhook_url=_env_str("SCAN_ALERT_WEBHOOK_URL", cls.scan_alert_webhook_url),
             database_path=_env_str("DATABASE_PATH", cls.database_path),
             dashboard_host=_env_str("DASHBOARD_HOST", cls.dashboard_host),
             dashboard_port=_env_int("DASHBOARD_PORT", cls.dashboard_port),

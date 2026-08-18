@@ -38,6 +38,8 @@ Market data → Indicators → Claude decision engine → Risk manager → Execu
 | `database/` | SQLite: trades, AI decision log, rejections, high-water mark, daily equity — all scoped per trading account (see Multi-account trading below) |
 | `dashboard/` | stdlib HTTP dashboard: positions, balance, P&L, win rate, confidence history, trade history, per-account breakdown |
 | `notifications/` | External alerting (generic Slack/Discord-compatible webhook) for kill-switch trips, execution failures, and crashes — off unless `ALERT_WEBHOOK_URL` is set |
+| `news/` | Finnhub adapter for market headlines and the high-impact economic calendar — used only by the scanner (see below), never by the live-trading `ai/engine.py` |
+| `scanner/` | Advisory-only market scanner: scans every symbol against price action *and* news, and notifies (never trades) when Claude thinks a symbol deserves a closer look. See "Scanner" below |
 | `backtesting/` | Replays history through the real risk manager and position management |
 | `powershell/` | `start_agent.ps1`, `restart_agent.ps1`, `watchdog.ps1`, `emergency_stop.ps1`, `update_agent.ps1` |
 
@@ -157,6 +159,48 @@ powershell/emergency_stop.ps1    # trips the kill switch and stops the process N
 `emergency_stop.ps1` does **not** close open broker positions — verify and
 close those manually in Tradovate/TradersPost.
 
+## Scanner
+
+```bash
+python -m futures_agent.scanner
+```
+
+A second, independent process from `python -m futures_agent.main` above.
+Where the trading agent's `ai/engine.py` is deliberately kept blind to news
+(see the design principle at the top of this file — Claude never sends
+orders, so it never needs an excuse to jump the risk manager), the scanner
+never sends an order at all, so there's no equivalent reason to keep it
+blind. Each scan cycle:
+
+1. Pulls recent market headlines and the next high-impact US economic event
+   from Finnhub (`news/finnhub_news.py`) — skipped, not fatal, when
+   `FINNHUB_API_KEY` isn't set; the scanner still runs on price action
+   alone.
+2. Refreshes candles/indicators/session levels for every symbol in
+   `SCAN_SYMBOLS` (default: every symbol in `config/symbols.SYMBOL_CATALOG`
+   — "scan everything" — independent of `TRADED_SYMBOLS`, which only
+   affects the live-trading agent).
+3. Asks Claude for one BUY/SELL/HOLD + confidence + reasoning per symbol
+   (`scanner/engine.py`'s `ScanDecisionEngine`), explicitly weighing the
+   news/event context alongside the technicals.
+4. Posts a notification — the same Slack/Discord-compatible webhook
+   mechanism as `ALERT_WEBHOOK_URL` (`SCAN_ALERT_WEBHOOK_URL`, or falls
+   back to `ALERT_WEBHOOK_URL` if unset) — whenever a symbol's action isn't
+   HOLD and its confidence clears `SCAN_MIN_CONFIDENCE` (default 70), with
+   a `SCAN_ALERT_COOLDOWN_MINUTES` cooldown per symbol so a persistent
+   setup doesn't re-notify every cycle.
+
+**This is advisory only.** Nothing in `scanner/` calls `risk/manager.py` or
+`execution/engine.py` — no confidence score, however high, results in an
+order. A notification means "Claude thinks this is worth a look," not
+"trade this." Decide for yourself, same as reading any other analysis.
+
+See `.env.example`'s Scanner section for every `SCAN_*`/`FINNHUB_API_KEY`
+variable. Point `SCAN_ALERT_WEBHOOK_URL` (or `ALERT_WEBHOOK_URL`) at a
+Slack/Discord incoming webhook, or a generic HTTP relay (e.g. a service
+that turns a webhook POST into a phone push notification) to actually get
+notified on your phone.
+
 ## Backtesting
 
 ```bash
@@ -217,7 +261,7 @@ this in production.
 ## Tests
 
 ```bash
-python -m pytest tests/ -v      # 317 tests, fully offline — no API keys or network required
+python -m pytest tests/ -v      # 361 tests, fully offline — no API keys or network required
 ```
 
 Every external integration (Tradovate, TradersPost, Claude) is exercised
